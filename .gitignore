@@ -1,0 +1,20 @@
+# Local builds and macOS/Xcode user state
+.build/
+.swiftpm/
+build/
+.DS_Store
+xcuserdata/
+*.xcuserstate
+
+# Personal family documents and interrupted-save files
+*.familytree
+*.familytree.backup
+*.familytree-journal
+*.familytree-wal
+*.familytree-shm
+*.familytree.*.saving*
+*.familytree.*.backup-saving*
+
+# Personal GEDCOM imports/exports; test fixtures live in Swift sources
+*.[gG][eE][dD]
+*.[gG][eE][dD][cC][oO][mM]
