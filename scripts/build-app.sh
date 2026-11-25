@@ -6,7 +6,7 @@ if [ -z "$BUILD_SCRATCH" ]; then BUILD_SCRATCH="$PROJECT_ROOT/.build"; fi
 cd "$PROJECT_ROOT"
 swift build --configuration release --scratch-path "$BUILD_SCRATCH"
 BIN_DIR="$(swift build --configuration release --scratch-path "$BUILD_SCRATCH" --show-bin-path)"
-APP_PATH="$PROJECT_ROOT/build/Родные.app"
+APP_PATH="$PROJECT_ROOT/build/FamilyTree.app"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 # Replace the executable inode so an already running version keeps its mapped binary.
 cp "$BIN_DIR/FamilyTree" "$APP_PATH/Contents/MacOS/FamilyTree.next"

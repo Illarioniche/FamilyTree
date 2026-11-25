@@ -6,6 +6,9 @@ struct TreeCanvasView: View {
     let project: FamilyProject
     @Binding var selection: UUID?
     let onAddRelative: (UUID) -> Void
+    let onChooseHomePerson: (() -> Void)?
+    let homeFocusRequest: Int
+    let onAddPerson: (() -> Void)?
     @Environment(\.colorScheme) private var colorScheme
     @State private var mode: TreeScopeMode
     @State private var focusID: UUID?
@@ -18,8 +21,9 @@ struct TreeCanvasView: View {
     @State private var focusHistory: [BranchHistoryEntry] = []
     private let sage = Palette.accent
 
-    init(project: FamilyProject, selection: Binding<UUID?>, onAddRelative: @escaping (UUID) -> Void, initialMode: TreeScopeMode? = nil) {
+    init(project: FamilyProject, selection: Binding<UUID?>, onAddRelative: @escaping (UUID) -> Void, initialMode: TreeScopeMode? = nil, onChooseHomePerson: (() -> Void)? = nil, homeFocusRequest: Int = 0, onAddPerson: (() -> Void)? = nil) {
         self.project = project; self._selection = selection; self.onAddRelative = onAddRelative
+        self.onChooseHomePerson = onChooseHomePerson; self.homeFocusRequest = homeFocusRequest; self.onAddPerson = onAddPerson
         _focusID = State(initialValue: selection.wrappedValue ?? project.rootPersonID ?? project.people.first?.id)
         _mode = State(initialValue: initialMode ?? .close)
     }
@@ -102,7 +106,10 @@ struct TreeCanvasView: View {
                     }
                 }
                 .onChange(of: project.rootPersonID) { _, root in
-                    if let root { navigate(to: root) }
+                    if let root { navigate(to: root, revealRelatives: true) }
+                }
+                .onChange(of: homeFocusRequest) { _, _ in
+                    if let root = project.rootPersonID { navigate(to: root, revealRelatives: true) }
                 }
                 .accessibilityIdentifier("familyTreeCanvas")
             }
@@ -162,6 +169,24 @@ struct TreeCanvasView: View {
                     .font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
                     .help("Виды дерева меняют только отображение. Все люди и связи остаются в файле.")
             }
+            HStack(spacing: 9) {
+                Image(systemName: "house").foregroundStyle(.secondary)
+                if let home = project.person(project.rootPersonID) {
+                    Text("Начало: \(home.shortName)")
+                        .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                        .help("Центр по умолчанию: \(home.fullName). Сохраняется в файле дерева.")
+                    Spacer(minLength: 4)
+                    Button("К началу") { navigate(to: home.id, revealRelatives: true) }
+                        .help("Вернуться к \(home.fullName)")
+                } else {
+                    Text("Центр по умолчанию не выбран").foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                }
+                if let onChooseHomePerson {
+                    Button("Изменить", action: onChooseHomePerson)
+                        .help("Указать, кто вы в этом дереве, и выбрать центр по умолчанию")
+                }
+            }.font(.system(size: 10)).buttonStyle(.plain).foregroundStyle(sage)
         }
         .padding(.horizontal, 22).padding(.vertical, 14)
         .background(Palette.surface.opacity(0.6))
@@ -331,6 +356,10 @@ struct TreeCanvasView: View {
                 .font(.system(size: 21, weight: .medium, design: .serif)).multilineTextAlignment(.center)
             Text("Добавьте себя или близкого человека.\nПостепенно здесь появится история вашей семьи.")
                 .font(.system(size: 13)).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(4)
+            if let onAddPerson {
+                Button(action: onAddPerson) { Label("Добавить первого человека", systemImage: "person.badge.plus") }
+                    .buttonStyle(.borderedProminent).controlSize(.large).tint(sage).padding(.top, 4)
+            }
         }.padding(36).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -346,7 +375,7 @@ private struct TreeFocusChooser: View {
     let select: (UUID) -> Void
     @State private var query = ""
     private var matches: [Person] {
-        project.people.filter { query.isEmpty || $0.fullName.localizedCaseInsensitiveContains(query) }
+        project.people.filter { query.isEmpty || $0.fullName.localizedCaseInsensitiveContains(query) || $0.maidenName.localizedCaseInsensitiveContains(query) }
             .sorted { $0.fullName.localizedStandardCompare($1.fullName) == .orderedAscending }
     }
     var body: some View {

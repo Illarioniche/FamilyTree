@@ -4,78 +4,121 @@ import FamilyTreeCore
 struct ContentView: View {
     @ObservedObject var store: FamilyStore
     var initialTreeMode: TreeScopeMode? = nil
-    @State private var inspectorVisible = true
+    @State private var sidebarVisible: Bool
+    @State private var inspectorVisible: Bool
+
+    init(store: FamilyStore, initialTreeMode: TreeScopeMode? = nil,
+         initiallyShowSidebar: Bool = true, initiallyShowInspector: Bool = true) {
+        self.store = store
+        self.initialTreeMode = initialTreeMode
+        _sidebarVisible = State(initialValue: initiallyShowSidebar)
+        _inspectorVisible = State(initialValue: initiallyShowInspector)
+    }
 
     var body: some View {
+        Group {
+            if store.showingTreeLibrary { TreeLibraryView(store: store) }
+            else { workspace }
+        }
+        .tint(Palette.accent)
+        .frame(minWidth: inspectorVisible ? 1050 : 750, minHeight: 650)
+        .toolbar {
+            ToolbarItemGroup(placement: .navigation) {
+                if !store.showingTreeLibrary {
+                    Button(action: store.showLibrary) { Label("Мои деревья", systemImage: "square.grid.2x2") }
+                        .help("Переключиться на другое дерево")
+                    Button { sidebarVisible.toggle() } label: {
+                        Label(sidebarVisible ? "Скрыть левую панель" : "Показать левую панель", systemImage: "sidebar.left")
+                    }
+                    .help(sidebarVisible ? "Скрыть левую панель" : "Показать левую панель")
+                    .accessibilityIdentifier("toggleLeftSidebar")
+                }
+            }
+            if !store.showingTreeLibrary {
+                if #available(macOS 26.0, *) {
+                    // A hidden window title no longer separates navigation and actions.
+                    ToolbarSpacer(.flexible, placement: .automatic)
+                } else {
+                    ToolbarItem(placement: .principal) { Spacer(minLength: 0) }
+                }
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                if !store.showingTreeLibrary {
+                    Button { store.undo() } label: { Image(systemName: "arrow.uturn.backward") }
+                        .disabled(store.undoStack.isEmpty).help("Отменить изменение · ⌘Z")
+                    Menu {
+                        Button("Создать дерево…", action: store.newProject)
+                        Button("Открыть дерево…", action: store.openProject)
+                        Divider()
+                        Button("Сохранить", action: { _ = store.save() })
+                        Button("Сохранить как…", action: { _ = store.saveAs() })
+                        Button("Переименовать дерево…") { store.showingProjectName = true }
+                        Button("Кто я в этом дереве…") { store.showingHomePersonPicker = true }
+                            .disabled(store.project.people.isEmpty)
+                        Divider()
+                        Button("Импортировать дерево…", action: store.importTree)
+                        Button("Экспортировать GEDCOM…", action: store.exportGEDCOM)
+                        Button("Разделить фамилии после импорта…") { store.showingSurnameReview = true }
+                            .disabled(store.surnameRepairSuggestions.isEmpty)
+                        Button("Показать файл в Finder", action: store.revealFile).disabled(store.fileURL == nil)
+                    } label: { Image(systemName: "ellipsis.circle") }
+                    .help("Действия с деревом")
+                    Button { inspectorVisible.toggle() } label: { Image(systemName: "sidebar.right") }
+                        .help("Показать или скрыть карточку")
+                    Button { store.addPerson() } label: { Label("Добавить человека", systemImage: "plus") }
+                        .buttonStyle(.borderedProminent).tint(Palette.accent)
+                }
+            }
+        }
+        .sheet(item: $store.treeCreation) { request in TreeCreationView(store: store, request: request) }
+        .sheet(item: $store.personEditor) { request in PersonEditor(store: store, request: request) }
+        .sheet(item: $store.eventEditor) { request in EventEditor(store: store, request: request) }
+        .sheet(isPresented: $store.showingRelationshipEditor) { RelationshipEditor(store: store) }
+        .sheet(isPresented: $store.showingProjectName) { ProjectNameEditor(store: store) }
+        .sheet(isPresented: $store.showingSurnameReview) { SurnameReviewView(store: store) }
+        .sheet(isPresented: $store.showingHomePersonPicker) { HomePersonPicker(store: store) }
+        .alert("Не удалось выполнить действие", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
+            Button("Понятно") { store.errorMessage = nil }
+        } message: { Text(store.errorMessage ?? "") }
+        .alert("Импорт дерева", isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })) {
+            Button("Понятно") { store.notice = nil }
+        } message: { Text(store.notice ?? "") }
+        .alert("FamilyTree", isPresented: Binding(get: { store.infoMessage != nil }, set: { if !$0 { store.infoMessage = nil } })) {
+            Button("Понятно") { store.infoMessage = nil }
+        } message: { Text(store.infoMessage ?? "") }
+        .onChange(of: store.query) { _, value in if !value.isEmpty { store.section = .people } }
+    }
+
+    private var workspace: some View {
         HStack(spacing: 0) {
-            SidebarView(store: store).frame(width: 216)
-            Divider()
+            if sidebarVisible {
+                SidebarView(store: store).frame(width: 216)
+                Divider()
+            }
             VStack(spacing: 0) {
                 contentHeader
                 Divider().opacity(0.6)
+                if !store.surnameRepairSuggestions.isEmpty { surnameReviewBanner }
                 sectionContent
                 if store.isExample { exampleBanner }
                 statusBar
             }
             .frame(minWidth: 450, maxWidth: .infinity, maxHeight: .infinity)
             .background(Palette.canvas)
-            if inspectorVisible {
+            if inspectorVisible && !store.project.people.isEmpty {
                 Divider()
                 PersonInspector(store: store).frame(width: 304)
             }
         }
-        .tint(Palette.accent)
-        .frame(minWidth: inspectorVisible ? 1050 : 750, minHeight: 650)
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                HStack(spacing: 7) {
-                    Image(systemName: "leaf.fill").foregroundStyle(Palette.accent)
-                    Text(store.project.title).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-                }
-            }
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button { store.undo() } label: { Image(systemName: "arrow.uturn.backward") }
-                    .disabled(store.undoStack.isEmpty).help("Отменить изменение · ⌘Z")
-                Menu {
-                    Button("Создать дерево…", action: store.newProject)
-                    Button("Открыть дерево…", action: store.openProject)
-                    Divider()
-                    Button("Сохранить", action: { _ = store.save() })
-                    Button("Сохранить как…", action: { _ = store.saveAs() })
-                    Button("Переименовать дерево…") { store.showingProjectName = true }
-                    Divider()
-                    Button("Импортировать GEDCOM…", action: store.importGEDCOM)
-                    Button("Экспортировать GEDCOM…", action: store.exportGEDCOM)
-                    Button("Показать файл в Finder", action: store.revealFile).disabled(store.fileURL == nil)
-                } label: { Image(systemName: "ellipsis.circle") }
-                .help("Действия с деревом")
-                Button { inspectorVisible.toggle() } label: { Image(systemName: "sidebar.right") }
-                    .help("Показать или скрыть карточку")
-                Button { store.addPerson() } label: { Label("Добавить человека", systemImage: "plus") }
-                    .buttonStyle(.borderedProminent).tint(Palette.accent)
-            }
-        }
-        .sheet(item: $store.personEditor) { request in PersonEditor(store: store, request: request) }
-        .sheet(item: $store.eventEditor) { request in EventEditor(store: store, request: request) }
-        .sheet(isPresented: $store.showingRelationshipEditor) { RelationshipEditor(store: store) }
-        .sheet(isPresented: $store.showingProjectName) { ProjectNameEditor(store: store) }
-        .alert("Не удалось выполнить действие", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
-            Button("Понятно") { store.errorMessage = nil }
-        } message: { Text(store.errorMessage ?? "") }
-        .alert("Импорт дерева", isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })) {
-            Button("Сохранить дерево…") { store.notice = nil; _ = store.saveAs() }
-            Button("Позже", role: .cancel) { store.notice = nil }
-        } message: { Text(store.notice ?? "") }
-        .alert("Родные", isPresented: Binding(get: { store.infoMessage != nil }, set: { if !$0 { store.infoMessage = nil } })) {
-            Button("Понятно") { store.infoMessage = nil }
-        } message: { Text(store.infoMessage ?? "") }
-        .onChange(of: store.query) { _, value in if !value.isEmpty { store.section = .people } }
     }
 
     private var contentHeader: some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 7) {
-                SectionCaption(title: "Ваша семейная история")
+                Text(TreeLibrary.displayTitle(store.project.title))
+                    .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                    .help(TreeLibrary.displayTitle(store.project.title))
                 Text(store.section.title).font(.system(size: 27, weight: .semibold, design: .rounded))
             }
             Spacer()
@@ -92,18 +135,39 @@ struct ContentView: View {
     @ViewBuilder private var sectionContent: some View {
         switch store.section {
         case .tree:
-            TreeCanvasView(project: store.project, selection: $store.selection, onAddRelative: { store.addPerson(relativeTo: $0) }, initialMode: initialTreeMode)
+            TreeCanvasView(project: store.project, selection: $store.selection,
+                           onAddRelative: { store.addPerson(relativeTo: $0) }, initialMode: initialTreeMode,
+                           onChooseHomePerson: { store.showingHomePersonPicker = true }, homeFocusRequest: store.homeFocusRequest,
+                           onAddPerson: { store.addPerson() })
         case .people: PeopleView(store: store)
         case .timeline: ChronicleView(store: store)
         case .archive: ArchiveView(store: store)
         }
     }
 
+    private var surnameReviewBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.text.rectangle").foregroundStyle(Palette.accent)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Основная и девичья фамилии").font(.system(size: 12, weight: .medium))
+                Text("В старом импорте часть фамилий сохранилась в биографиях.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button("Проверить") { store.showingSurnameReview = true }
+                .buttonStyle(.bordered).controlSize(.small)
+        }
+        .padding(.horizontal, 22).padding(.vertical, 12)
+        .background(Palette.accent.opacity(0.06))
+        .overlay(alignment: .bottom) { Rectangle().fill(Palette.divider).frame(height: 1) }
+    }
+
     private var exampleBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "sparkles").foregroundStyle(Palette.accent)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Знакомство с «Родными»").font(.system(size: 11, weight: .semibold))
+                Text("Знакомство с «FamilyTree»").font(.system(size: 11, weight: .semibold))
                 Text("Это вымышленная семья. Здесь можно попробовать все функции.")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
@@ -142,8 +206,9 @@ private struct SidebarView: View {
                     .foregroundStyle(.white).frame(width: 39, height: 39)
                     .background(Palette.accent.gradient, in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Родные").font(.system(size: 20, weight: .semibold, design: .rounded))
-                    Text("Всё начинается с семьи").font(.system(size: 9)).foregroundStyle(.secondary)
+                    Text("FamilyTree").font(.system(size: 20, weight: .semibold, design: .rounded))
+                    Text(TreeLibrary.displayTitle(store.project.title)).font(.system(size: 9)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
                 }
             }.padding(.horizontal, 21).padding(.top, 25).padding(.bottom, 25)
 
@@ -159,7 +224,7 @@ private struct SidebarView: View {
             .padding(9).background(.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
             .padding(.horizontal, 15).padding(.bottom, 26)
 
-            SectionCaption(title: "Библиотека").padding(.leading, 23).padding(.bottom, 10)
+            SectionCaption(title: "В этом дереве").padding(.leading, 23).padding(.bottom, 10)
             VStack(spacing: 4) {
                 ForEach(LibrarySection.allCases) { section in
                     Button { store.section = section; store.query = "" } label: {
@@ -211,57 +276,5 @@ private struct SidebarView: View {
             }.padding(.horizontal, 20).padding(.bottom, 22)
         }
         .background(.regularMaterial)
-    }
-}
-
-private struct PeopleView: View {
-    @ObservedObject var store: FamilyStore
-    @State private var favoritesOnly = false
-    private var people: [Person] { store.filteredPeople.filter { !favoritesOnly || $0.isFavorite } }
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(store.query.isEmpty ? "Все близкие в одном месте" : "Результаты поиска")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-                Spacer()
-                Toggle("Избранные", isOn: $favoritesOnly).toggleStyle(.checkbox).font(.system(size: 11))
-            }.padding(.horizontal, 28).padding(.vertical, 17)
-            if people.isEmpty {
-                EmptyCollectionView(symbol: "person.crop.circle.badge.questionmark", title: "Никого не нашли",
-                                    subtitle: "Измените запрос или добавьте первого человека.",
-                                    actionTitle: "Добавить человека", action: { store.addPerson() })
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 14)], spacing: 14) {
-                        ForEach(people) { person in
-                            Button { store.selection = person.id } label: {
-                                VStack(alignment: .leading, spacing: 15) {
-                                    HStack {
-                                        PersonAvatar(person: person, project: store.project, size: 47)
-                                        Spacer()
-                                        if person.isFavorite { Image(systemName: "star.fill").font(.system(size: 10)).foregroundStyle(.orange.opacity(0.7)) }
-                                    }
-                                    VStack(alignment: .leading, spacing: 5) {
-                                        Text(person.fullName).font(.system(size: 14, weight: .medium)).lineLimit(2)
-                                        Text(person.lifespan).font(.system(size: 11)).foregroundStyle(.secondary)
-                                        if !person.birthPlace.isEmpty {
-                                            Label(person.birthPlace, systemImage: "mappin").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
-                                        }
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading).padding(19)
-                                .background(Palette.surface, in: RoundedRectangle(cornerRadius: 15))
-                                .overlay(RoundedRectangle(cornerRadius: 15).stroke(store.selection == person.id ? Palette.accent : Palette.divider, lineWidth: store.selection == person.id ? 1.5 : 1))
-                            }
-                            .buttonStyle(.plain).contextMenu {
-                                Button("Редактировать") { store.edit(person) }
-                                Button("Показать на дереве") { store.selection = person.id; store.section = .tree }
-                                Button("Добавить родственника") { store.addPerson(relativeTo: person.id) }
-                            }
-                        }
-                    }.padding(.horizontal, 28).padding(.bottom, 28)
-                }
-            }
-        }
     }
 }

@@ -2,8 +2,9 @@ import XCTest
 @testable import FamilyTreeCore
 
 final class GEDCOMTests: XCTestCase {
-    private func read(_ body: String, version: String = "5.5.1") throws -> GEDCOMImportResult {
-        try GEDCOM.importData(Data(("0 HEAD\n1 GEDC\n2 VERS \(version)\n1 CHAR UTF-8\n" + body + "\n0 TRLR\n").utf8))
+    private func read(_ body: String, version: String = "5.5.1", source: String? = nil) throws -> GEDCOMImportResult {
+        let sourceLine = source.map { "1 SOUR \($0)\n" } ?? ""
+        return try GEDCOM.importData(Data(("0 HEAD\n" + sourceLine + "1 GEDC\n2 VERS \(version)\n1 CHAR UTF-8\n" + body + "\n0 TRLR\n").utf8))
     }
 
     func testImportsCyrillicNamesDatesFamiliesAndMultilineNotes() throws {
@@ -47,7 +48,7 @@ final class GEDCOMTests: XCTestCase {
         XCTAssertEqual(result.project.events.filter { $0.kind == .marriage }.count, 2)
     }
 
-    func testFamytaleAdditionalNameIsPreservedWithoutGuessingSurnameRole() throws {
+    func testUnknownExporterAdditionalNameIsPreservedWithoutGuessingSurnameRole() throws {
         let result = try read("""
         0 @I1@ INDI
         1 NAME Анна /Смирнова/
@@ -67,7 +68,7 @@ final class GEDCOMTests: XCTestCase {
         XCTAssertEqual(roundTrip.project.people.first?.biography, person.biography)
     }
 
-    func testFamytaleRepeatedAdditionalNamesArePreservedOnce() throws {
+    func testUnknownExporterRepeatedAdditionalNamesArePreservedOnce() throws {
         let result = try read("""
         0 @I1@ INDI
         1 NAME Анна /Смирнова/
@@ -77,6 +78,278 @@ final class GEDCOMTests: XCTestCase {
         """)
         XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: Петрова")
         XCTAssertEqual(result.warnings.filter { $0.contains("_MARNM") }.count, 1)
+    }
+
+    func testFamytaleSeparatesMainAndMaidenSurnameWithoutDependingOnGender() throws {
+        for gender in ["F", "M", "U"] {
+            let result = try read("""
+            0 @I1@ INDI
+            1 NAME Анна /Смирнова/
+            2 GIVN Анна
+            2 SURN Смирнова
+            2 _MARNM Петрова
+            1 SEX \(gender)
+            1 NOTE Семейное воспоминание.
+            """, source: "FAMYTALE")
+            let person = try XCTUnwrap(result.project.people.first)
+            XCTAssertEqual(person.givenName, "Анна")
+            XCTAssertEqual(person.familyName, "Петрова")
+            XCTAssertEqual(person.maidenName, "Смирнова")
+            XCTAssertEqual(person.biography, "Семейное воспоминание.")
+            XCTAssertFalse(result.warnings.contains { $0.contains("_MARNM") })
+        }
+    }
+
+    func testFamytaleIdenticalAdditionalSurnamesAreOneCandidate() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Смирнова/
+        2 _MARNM Петрова
+        2 _MARNM Петрова
+        2 _MARNM  ПЕТРОВА\u{20}
+        2 _MARNM
+        """, source: "  famytale  ")
+        XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "")
+    }
+
+    func testFamytaleEqualSurnamesDoNotInventMaidenName() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Смирнова/
+        2 _MARNM Смирнова
+        """, source: "FAMYTALE")
+        XCTAssertEqual(result.project.people.first?.familyName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "")
+        XCTAssertEqual(result.project.people.first?.biography, "")
+    }
+
+    func testFamytaleConflictingExplicitMaidenNameIsNotOverwritten() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Смирнова/
+        2 _MARNM Петрова
+        1 _FT_MAIDEN Белова
+        """, source: "FAMYTALE")
+        XCTAssertEqual(result.project.people.first?.familyName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Белова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: Петрова")
+        XCTAssertTrue(result.warnings.contains { $0.contains("_MARNM") })
+    }
+
+    func testFamytaleMatchingExplicitMaidenNameAllowsMainSurname() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Смирнова/
+        2 _MARNM Петрова
+        1 _FT_MAIDEN Смирнова
+        """, source: "FAMYTALE")
+        XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "")
+    }
+
+    func testFamytaleMultipleMarriedSurnamesArePreservedWithoutChoosingLatest() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Смирнова/
+        2 _MARNM Петрова
+        2 _MARNM Волкова
+        """, source: "FAMYTALE")
+        XCTAssertEqual(result.project.people.first?.familyName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: Петрова\n\nДругое имя из GEDCOM: Волкова")
+        XCTAssertEqual(result.warnings.filter { $0.contains("_MARNM") }.count, 1)
+    }
+
+    func testFamytaleFullNamesAndSpaceSeparatedCompoundsArePreservedIntact() throws {
+        for alternative in ["Анна Петровна Петрова", "Анна /Петрова/", "де ла Крус"] {
+            let result = try read("""
+            0 @I1@ INDI
+            1 NAME Анна /Смирнова/
+            2 _MARNM \(alternative)
+            """, source: "FAMYTALE")
+            XCTAssertEqual(result.project.people.first?.familyName, "Смирнова")
+            XCTAssertEqual(result.project.people.first?.maidenName, "")
+            XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: " + alternative)
+            XCTAssertTrue(result.warnings.contains { $0.contains("_MARNM") })
+        }
+    }
+
+    func testFamytaleHyphenatedAndApostropheSurnamesRemainWhole() throws {
+        for alternative in ["Петрова-Волкова", "О’Коннор", "D'Arcy"] {
+            let result = try read("0 @I1@ INDI\n1 NAME Анна /Смирнова/\n2 _MARNM " + alternative, source: "FAMYTALE")
+            XCTAssertEqual(result.project.people.first?.familyName, alternative)
+            XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        }
+    }
+
+    func testFamytaleDialectRequiresExactSourceIdentifier() throws {
+        for source in ["OTHER", "FAMYTALE-OTHER", "OTHER\n2 NAME FamyTale"] {
+            let result = try read("0 @I1@ INDI\n1 NAME Анна /Смирнова/\n2 _MARNM Петрова", source: source)
+            XCTAssertEqual(result.project.people.first?.familyName, "Смирнова")
+            XCTAssertEqual(result.project.people.first?.maidenName, "")
+            XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: Петрова")
+        }
+    }
+
+    func testFamytaleMultipleNamesKeepPreferredMainNameAndExplicitMaiden() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Волкова/
+        2 _MARNM Петрова
+        1 NAME Анна /Смирнова/
+        2 TYPE birth
+        """, source: "FAMYTALE")
+        XCTAssertEqual(result.project.people.first?.familyName, "Волкова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: Петрова")
+    }
+
+    func testFamytaleKnownMarriedPrimaryNameDoesNotBecomeMaiden() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Волкова/
+        2 TYPE married
+        2 _MARNM Петрова
+        """, source: "FAMYTALE")
+        XCTAssertEqual(result.project.people.first?.familyName, "Волкова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя из GEDCOM: Петрова")
+    }
+
+    func testTypedBirthAndMaidenNamesAcceptSurnameWithoutSlashNotation() throws {
+        for type in ["birth", "MAIDEN"] {
+            let result = try read("""
+            0 @I1@ INDI
+            1 NAME Анна /Петрова/
+            1 NAME
+            2 TYPE \(type)
+            2 SURN Смирнова
+            """)
+            XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+            XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+            XCTAssertEqual(result.project.people.first?.biography, "")
+        }
+    }
+
+    func testTypedNamesKeepFirstPreferredNameAndPreserveOtherGivenNames() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Волкова/
+        2 TYPE married
+        1 NAME Анна Петровна /Смирнова/
+        2 TYPE birth
+        1 NAME Анна /Петрова/
+        2 TYPE married
+        """)
+        XCTAssertEqual(result.project.people.first?.givenName, "Анна")
+        XCTAssertEqual(result.project.people.first?.familyName, "Волкова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя: Анна Петровна Смирнова\n\nДругое имя: Анна Петрова")
+    }
+
+    func testTypedMaidenNamePreservesPatronymicEvenWhenGivenComponentMatches() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Петрова/
+        2 GIVN Анна
+        1 NAME Анна Ивановна /Смирнова/
+        2 TYPE maiden
+        2 GIVN Анна
+        2 SURN Смирнова
+        """)
+        XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя: Анна Ивановна Смирнова")
+    }
+
+    func testConflictingTypedMaidenNamesRemainAvailableAsNotes() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Петрова/
+        1 _FT_MAIDEN Белова
+        1 NAME
+        2 TYPE birth
+        2 SURN Смирнова
+        1 NAME Анна /Белова/
+        2 TYPE maiden
+        """)
+        XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Белова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя: Смирнова")
+        XCTAssertTrue(result.warnings.contains { $0.contains("Разные девичьи фамилии") })
+    }
+
+    func testPreferredBirthNameIsNotReplacedByLaterMarriedName() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Смирнова/
+        2 TYPE birth
+        1 NAME Анна /Петрова/
+        2 TYPE married
+        """)
+        XCTAssertEqual(result.project.people.first?.familyName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя: Анна Петрова")
+    }
+
+    func testExportIncludesStandardMaidenNameAndRepeatedRoundTripsDoNotAddNotes() throws {
+        let person = Person(givenName: "Анна", patronymic: "Петровна", familyName: "Волкова", maidenName: "Смирнова", biography: "История семьи")
+        let project = FamilyProject(people: [person])
+        let data = GEDCOM.export(project)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertTrue(text.contains("1 NAME Анна Петровна /Волкова/"))
+        XCTAssertTrue(text.contains("1 _FT_MAIDEN Смирнова"))
+        XCTAssertTrue(text.contains("1 NAME Анна Петровна /Смирнова/\r\n2 TYPE maiden\r\n2 GIVN Анна Петровна\r\n2 SURN Смирнова"))
+        let once = try GEDCOM.importData(data)
+        let twice = try GEDCOM.importData(GEDCOM.export(once.project))
+        XCTAssertEqual(once.project.people, project.people)
+        XCTAssertEqual(twice.project.people, project.people)
+        XCTAssertTrue(once.warnings.isEmpty)
+        XCTAssertTrue(twice.warnings.isEmpty)
+    }
+
+    func testUnusualNamesAndMaidenSurnamesStayStableAcrossRepeatedRoundTrips() throws {
+        for givenName in ["Анна/Аня", "Анна@дом", String(repeating: "Александра", count: 15)] {
+            let person = Person(givenName: givenName, familyName: "Петрова", maidenName: "Смирнова", biography: "История")
+            var project = FamilyProject(people: [person])
+            for _ in 0..<5 {
+                project = try GEDCOM.importData(GEDCOM.export(project)).project
+                XCTAssertEqual(project.people, [person])
+            }
+        }
+    }
+
+    func testNameContinuationAndEscapesAreDecodedWithoutStructuredComponents() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна@@дом /Пет
+        2 CONC рова/
+        1 NAME Анна@@дом /Сми
+        2 CONC рнова/
+        2 TYPE maiden
+        """)
+        XCTAssertEqual(result.project.people.first?.givenName, "Анна@дом")
+        XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "")
+    }
+
+    func testTypedMaidenNameKeepsSuffixAndConflictingStructuredGivenName() throws {
+        let result = try read("""
+        0 @I1@ INDI
+        1 NAME Анна /Петрова/
+        1 NAME Анна /Смирнова/ младшая
+        2 TYPE maiden
+        1 NAME Анна /Смирнова/
+        2 TYPE maiden
+        2 GIVN Мария
+        """)
+        XCTAssertEqual(result.project.people.first?.familyName, "Петрова")
+        XCTAssertEqual(result.project.people.first?.maidenName, "Смирнова")
+        XCTAssertEqual(result.project.people.first?.biography, "Другое имя: Анна Смирнова младшая\n\nДругое имя: Анна Смирнова\n\nДругое имя: Мария Смирнова")
     }
 
     func testSingleParentAndAdoptionFromPedigree() throws {

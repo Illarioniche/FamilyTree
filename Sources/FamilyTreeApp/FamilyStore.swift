@@ -39,12 +39,22 @@ struct EventEditRequest: Identifiable {
     var event: FamilyEvent
 }
 
+struct TreeCreationRequest: Identifiable {
+    let id = UUID()
+    var project: FamilyProject
+    var warnings: [String]
+    var isImport: Bool
+}
+
 @MainActor
 final class FamilyStore: ObservableObject {
     @Published private(set) var project: FamilyProject
     @Published var selection: UUID?
     @Published var section: LibrarySection = .tree
     @Published var query = ""
+    @Published var showingTreeLibrary = true
+    @Published private(set) var savedTrees: [TreeLibraryEntry] = []
+    @Published var treeCreation: TreeCreationRequest?
     @Published private(set) var fileURL: URL?
     @Published private(set) var hasUnsavedChanges = false
     @Published private(set) var isExample = true
@@ -56,33 +66,53 @@ final class FamilyStore: ObservableObject {
     @Published var eventEditor: EventEditRequest?
     @Published var showingRelationshipEditor = false
     @Published var showingProjectName = false
+    @Published var showingSurnameReview = false
+    @Published var showingHomePersonPicker = false
+    @Published var peopleSearchRequest = 0
+    @Published private(set) var homeFocusRequest = 0
     @Published private(set) var undoStack: [FamilyProject] = []
     @Published private(set) var redoStack: [FamilyProject] = []
     private let isPreview: Bool
+    private let library: TreeLibrary
+    private let libraryDirectoryURL: URL
+    private var registeredTreeURLs: [URL]
+    private static let registeredTreesKey = "registeredTreePaths"
 
-    init(preview: Bool = false) {
+    init(preview: Bool = false, libraryDirectoryURL: URL? = nil) {
         isPreview = preview
+        let directory = libraryDirectoryURL ?? (preview
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("FamilyTreePreview-" + UUID().uuidString, isDirectory: true)
+            : FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("FamilyTree/Trees", isDirectory: true))
+        self.libraryDirectoryURL = directory.standardizedFileURL.resolvingSymlinksInPath()
+        library = TreeLibrary(directoryURL: directory)
+        registeredTreeURLs = preview ? [] : (UserDefaults.standard.stringArray(forKey: Self.registeredTreesKey) ?? []).map { URL(fileURLWithPath: $0) }
         project = .demo
         selection = project.rootPersonID
         if !preview, let path = UserDefaults.standard.string(forKey: "lastProjectPath") {
             let url = URL(fileURLWithPath: path)
+            registerExternalTree(url)
             do {
                 project = try ProjectDatabase.load(from: url)
                 fileURL = url; selection = project.rootPersonID ?? project.people.first?.id
                 isExample = false; lastSavedAt = project.modifiedAt
             } catch {
-                errorMessage = "Не удалось открыть последнее дерево. Исходный файл не изменён.\n\n\(error.localizedDescription)"
+                // The library lists unavailable external documents with their issue.
+                // Keep the previous document untouched and let the user choose another tree.
             }
         }
+        refreshLibrary()
     }
 
     var selectedPerson: Person? { project.person(selection) }
+    var surnameRepairSuggestions: [SurnameRepairSuggestion] { LegacySurnameRepair.suggestions(in: project) }
+
+    func applySurnameRepairs(_ suggestions: [SurnameRepairSuggestion]) {
+        mutate { _ = LegacySurnameRepair.apply(suggestions, to: &$0) }
+    }
     var filteredPeople: [Person] {
-        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return project.people.filter { person in
-            term.isEmpty || [person.fullName, person.maidenName, person.birthPlace, person.birthDate, person.occupation]
-                .contains { $0.localizedCaseInsensitiveContains(term) }
-        }.sorted { $0.fullName.localizedStandardCompare($1.fullName) == .orderedAscending }
+        PeopleSearch.filter(project.people, query: query)
+            .sorted { $0.fullName.localizedStandardCompare($1.fullName) == .orderedAscending }
     }
     var status: String {
         if hasUnsavedChanges { return "Есть несохранённые изменения" }
@@ -126,6 +156,7 @@ final class FamilyStore: ObservableObject {
         do {
             try ProjectDatabase.save(project, to: url)
             hasUnsavedChanges = false; lastSavedAt = Date(); isExample = false
+            updateLibraryEntry(at: url)
             return true
         } catch { errorMessage = "Не удалось сохранить дерево. Изменения остаются в приложении.\n\n\(error.localizedDescription)"; return false }
     }
@@ -145,17 +176,39 @@ final class FamilyStore: ObservableObject {
         } catch { errorMessage = error.localizedDescription; return false }
     }
 
+    func showLibrary() {
+        refreshLibrary()
+        showingTreeLibrary = true
+    }
+
+    func refreshLibrary() {
+        do { savedTrees = try library.entries(additionalURLs: registeredTreeURLs) }
+        catch { errorMessage = "Не удалось прочитать библиотеку деревьев.\n\n\(error.localizedDescription)" }
+    }
+
     func newProject() {
+        errorMessage = nil
+        treeCreation = TreeCreationRequest(project: FamilyProject(title: "Моя семья"), warnings: [], isImport: false)
+    }
+
+    func completeTreeCreation(title: String) {
+        guard let request = treeCreation else { return }
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { errorMessage = "Укажите название дерева."; return }
         guard confirmLeaving() else { return }
-        let panel = NSSavePanel()
-        panel.title = "Создать своё дерево"
-        panel.message = "Выберите локальную папку. Каждое изменение будет сохраняться автоматически."
-        panel.allowedContentTypes = [.familyTree]
-        panel.nameFieldStringValue = "Моя семья.familytree"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let new = FamilyProject(title: url.deletingPathExtension().lastPathComponent)
-        do { try ProjectDatabase.save(new, to: url); replaceProject(new, url: url); addPerson() }
-        catch { errorMessage = error.localizedDescription }
+        var created = request.project
+        created.id = UUID()
+        created.title = title
+        created.createdAt = Date(); created.modifiedAt = created.createdAt
+        do {
+            let url = try library.create(created)
+            replaceProject(created, url: url)
+            treeCreation = nil
+        } catch { errorMessage = "Не удалось создать дерево.\n\n\(error.localizedDescription)" }
+    }
+
+    func openLibraryTree(_ entry: TreeLibraryEntry) {
+        openProject(at: entry.url)
     }
 
     func openProject() {
@@ -177,6 +230,8 @@ final class FamilyStore: ObservableObject {
         project = new; fileURL = url; isExample = false; hasUnsavedChanges = url == nil
         selection = new.rootPersonID ?? new.people.first?.id
         section = .tree; query = ""; undoStack.removeAll(); redoStack.removeAll()
+        showingSurnameReview = false; showingHomePersonPicker = false
+        showingTreeLibrary = false; treeCreation = nil
         lastSavedAt = url == nil ? nil : new.modifiedAt
         if let url { remember(url) }
     }
@@ -188,6 +243,8 @@ final class FamilyStore: ObservableObject {
 
     func confirmLeaving() -> Bool {
         guard hasUnsavedChanges else { return true }
+        // Preview/check modes never show a dialog or silently discard an edited tree.
+        guard !isPreview else { return false }
         let alert = NSAlert()
         alert.messageText = "Сохранить изменения в дереве?"
         alert.informativeText = "В дереве «\(project.title)» есть изменения, которые ещё не записаны в файл."
@@ -201,21 +258,38 @@ final class FamilyStore: ObservableObject {
         }
     }
 
-    func importGEDCOM() {
-        guard confirmLeaving() else { return }
+    func importGEDCOM() { importTree() }
+
+    func importTree() {
         let panel = NSOpenPanel()
-        panel.title = "Импортировать GEDCOM"
-        panel.message = "Создаст отдельное дерево. Исходный GEDCOM останется без изменений."
-        panel.allowedContentTypes = [UTType(filenameExtension: "ged") ?? .plainText, .plainText, .data]
-        panel.allowsMultipleSelection = false
+        panel.title = "Импортировать дерево"
+        panel.message = "Выберите GEDCOM или файл .familytree. В библиотеке появится отдельная копия."
+        panel.allowedContentTypes = [.familyTree, UTType(filenameExtension: "ged") ?? .plainText, .plainText, .data]
+        panel.allowsMultipleSelection = false; panel.canChooseDirectories = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        _ = prepareTreeImport(at: url)
+    }
+
+    /// Shared by the file picker and isolated checks. Reading never replaces the active document.
+    @discardableResult func prepareTreeImport(at url: URL) -> Bool {
+        errorMessage = nil
         do {
-            let result = try GEDCOM.importData(Data(contentsOf: url), title: url.deletingPathExtension().lastPathComponent)
-            try ProjectValidation.validate(result.project)
-            replaceProject(result.project, url: nil)
-            notice = "Импортировано людей: \(project.people.count). Сохраните дерево в формате .familytree."
-                + (result.warnings.isEmpty ? "" : "\n\n" + result.warnings.joined(separator: "\n"))
-        } catch { errorMessage = "Импорт не выполнен.\n\n\(error.localizedDescription)" }
+            let imported: FamilyProject
+            let warnings: [String]
+            if url.pathExtension.lowercased() == "familytree" {
+                imported = try ProjectDatabase.load(from: url)
+                warnings = []
+            } else {
+                let result = try GEDCOM.importData(Data(contentsOf: url), title: "Моя семья")
+                imported = result.project; warnings = result.warnings
+            }
+            try ProjectValidation.validate(imported)
+            treeCreation = TreeCreationRequest(project: imported, warnings: warnings, isImport: true)
+            return true
+        } catch {
+            errorMessage = "Импорт не выполнен.\n\n\(error.localizedDescription)"
+            return false
+        }
     }
 
     func exportGEDCOM() {
@@ -270,7 +344,24 @@ final class FamilyStore: ObservableObject {
     func toggleFavorite(_ person: Person) {
         mutate { tree in if let index = tree.people.firstIndex(where: { $0.id == person.id }) { tree.people[index].isFavorite.toggle() } }
     }
-    func setRoot(_ id: UUID) { mutate { $0.rootPersonID = id }; selection = id; section = .tree }
+    /// The default centre belongs to the document; browsing another branch does not change it.
+    func setRoot(_ id: UUID) {
+        guard project.person(id) != nil else { return }
+        mutate { $0.rootPersonID = id }
+        guard project.rootPersonID == id else { return }
+        goToHomePerson()
+    }
+
+    func goToHomePerson() {
+        guard let id = project.rootPersonID, project.person(id) != nil else { return }
+        selection = id; section = .tree
+        homeFocusRequest += 1
+    }
+
+    func focusPeopleSearch() {
+        section = .people
+        peopleSearchRequest += 1
+    }
 
     func saveEvent(_ event: FamilyEvent) {
         mutate { tree in
@@ -331,10 +422,33 @@ final class FamilyStore: ObservableObject {
 
     func revealFile() { if let fileURL { NSWorkspace.shared.activateFileViewerSelecting([fileURL]) } }
     private func remember(_ url: URL) {
+        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        registerExternalTree(canonical)
+        updateLibraryEntry(at: canonical)
         guard !isPreview else { return }
-        UserDefaults.standard.set(url.path, forKey: "lastProjectPath")
-        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        UserDefaults.standard.set(canonical.path, forKey: "lastProjectPath")
+        NSDocumentController.shared.noteNewRecentDocumentURL(canonical)
     }
+
+    private func registerExternalTree(_ url: URL) {
+        let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard canonical.deletingLastPathComponent() != libraryDirectoryURL else { return }
+        if !registeredTreeURLs.contains(where: { $0.standardizedFileURL.resolvingSymlinksInPath() == canonical }) {
+            registeredTreeURLs.append(canonical)
+        }
+        if !isPreview { UserDefaults.standard.set(registeredTreeURLs.map(\.path), forKey: Self.registeredTreesKey) }
+    }
+
+    /// Autosave only updates the active entry; a full directory scan is needed when opening the library.
+    private func updateLibraryEntry(at url: URL) {
+        let entry = TreeLibraryEntry(url: url, title: project.title, peopleCount: project.people.count, modifiedAt: project.modifiedAt)
+        savedTrees.removeAll { $0.id == entry.id }
+        savedTrees.append(entry)
+        savedTrees.sort {
+            $0.modifiedAt == $1.modifiedAt ? $0.id < $1.id : $0.modifiedAt > $1.modifiedAt
+        }
+    }
+
 }
 
 enum AppError: LocalizedError {

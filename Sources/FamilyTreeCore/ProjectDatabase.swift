@@ -22,9 +22,43 @@ public enum ProjectDatabaseError: LocalizedError {
     }
 }
 
+/// Lightweight library metadata. Opening the document still performs full validation.
+public struct ProjectLibrarySummary: Equatable, Sendable {
+    public let title: String
+    public let peopleCount: Int
+    public let modifiedAt: Date
+}
+
 /// A portable SQLite document. Attachments are embedded, so moving the file moves the entire tree.
 public enum ProjectDatabase {
     private static let applicationID = 1_179_931_205 // ASCII "FTRE"
+
+    /// Reads the document header and count without materializing attachment BLOBs.
+    /// This is a listing summary, not a substitute for full validation on open/save.
+    public static func librarySummary(from url: URL) throws -> ProjectLibrarySummary {
+        let database = try Database(url: url, readOnly: true)
+        guard try database.integer("PRAGMA application_id") == applicationID else {
+            throw ProjectDatabaseError.unrecognizedFormat
+        }
+        let version = try database.integer("PRAGMA user_version")
+        guard version == FamilyProject.currentFormatVersion else {
+            throw ProjectValidationError.unsupportedVersion(version)
+        }
+        guard try database.integer("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('project', 'people', 'relationships', 'events', 'attachments')") == 5 else {
+            throw ProjectDatabaseError.corruptData("отсутствуют таблицы проекта")
+        }
+        var summary: ProjectLibrarySummary?
+        let peopleCount = try database.integer("SELECT COUNT(*) FROM people")
+        try database.rows("SELECT id, title, modified_at, format_version FROM project") { row in
+            guard summary == nil else { throw ProjectDatabaseError.corruptData("несколько заголовков проекта") }
+            _ = try row.uuid(0)
+            guard try row.integer(3) == version else { throw ProjectDatabaseError.corruptData("версии заголовка и базы не совпадают") }
+            summary = ProjectLibrarySummary(title: try row.text(1), peopleCount: peopleCount,
+                                            modifiedAt: Date(timeIntervalSinceReferenceDate: try row.real(2)))
+        }
+        guard let summary else { throw ProjectDatabaseError.corruptData("отсутствует заголовок проекта") }
+        return summary
+    }
 
     public static func load(from url: URL) throws -> FamilyProject {
         let database = try Database(url: url, readOnly: true)

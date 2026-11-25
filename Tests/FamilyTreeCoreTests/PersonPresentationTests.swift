@@ -3,12 +3,13 @@ import XCTest
 
 final class PersonPresentationTests: XCTestCase {
     func testNamesUseSurnameGivenNamePatronymicWithoutChangingStoredParts() {
-        let person = Person(givenName: "Анна", patronymic: "Петровна", familyName: "Волкова")
+        let person = Person(givenName: "Анна", patronymic: "Петровна", familyName: "Волкова", maidenName: "Белова")
         XCTAssertEqual(person.fullName, "Волкова Анна Петровна")
         XCTAssertEqual(person.shortName, "Волкова Анна")
         XCTAssertEqual(person.givenName, "Анна")
         XCTAssertEqual(person.patronymic, "Петровна")
         XCTAssertEqual(person.familyName, "Волкова")
+        XCTAssertEqual(person.maidenName, "Белова")
         // GEDCOM often puts the given name and patronymic together in GIVN.
         let imported = Person(givenName: "Анна Петровна", familyName: "Волкова")
         XCTAssertEqual(imported.fullName, "Волкова Анна Петровна")

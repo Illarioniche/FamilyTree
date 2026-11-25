@@ -39,6 +39,7 @@ public enum GEDCOM {
         }
         let records = try parse(source)
         guard let head = records.first, head.tag == "HEAD" else { throw GEDCOMError.missingHeader }
+        let isFamytale = head.child("SOUR")?.value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "FAMYTALE"
         var warnings: [String] = []
         func warn(_ value: String) { if !warnings.contains(value) { warnings.append(value) } }
         if records.last?.tag != "TRLR" { warn("В файле нет завершающей записи TRLR; прочитанные записи импортированы.") }
@@ -88,7 +89,7 @@ public enum GEDCOM {
             usedIDs.insert(id); personIDs[ref] = id
             let names = record.children.filter { $0.tag == "NAME" }
             let name = names.first
-            let pieces = (name?.value ?? "").components(separatedBy: "/")
+            let pieces = (name?.text ?? "").components(separatedBy: "/")
             let firstPart = pieces.first?.trimmingCharacters(in: .whitespaces) ?? ""
             let surname = pieces.count > 1 ? pieces[1].trimmingCharacters(in: .whitespaces) : ""
             let given = name?.child("GIVN")?.text ?? firstPart
@@ -114,22 +115,79 @@ public enum GEDCOM {
             }
             person.occupation = record.child("OCCU")?.text ?? ""
             person.biography = notes(record)
-            for alternate in names.dropFirst() {
-                let type = alternate.child("TYPE")?.value.lowercased() ?? ""
-                let parts = alternate.value.components(separatedBy: "/")
-                if ["maiden", "birth"].contains(type), parts.count > 1, person.maidenName.isEmpty {
-                    person.maidenName = alternate.child("SURN")?.text ?? parts[1]
-                } else if !alternate.value.isEmpty {
-                    person.biography += (person.biography.isEmpty ? "" : "\n\n") + "Другое имя: " + alternate.value.replacingOccurrences(of: "/", with: "")
+            func preserveName(_ value: String, fromGEDCOM: Bool = false) {
+                guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                person.biography += (person.biography.isEmpty ? "" : "\n\n")
+                    + (fromGEDCOM ? "Другое имя из GEDCOM: " : "Другое имя: ") + value
+            }
+            // NAME order expresses preference. Typed alternatives supply a maiden
+            // surname, but never replace the preferred (first) main name.
+            for (index, alternate) in names.enumerated() {
+                let type = alternate.child("TYPE")?.value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                var represented = false
+                var conflict = false
+                if ["maiden", "birth"].contains(type), let alternateSurname = surnameFromName(alternate) {
+                    if person.maidenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        person.maidenName = alternateSurname
+                    }
+                    represented = sameName(person.maidenName, alternateSurname)
+                    conflict = !represented
+                    if conflict {
+                        warn("Разные девичьи фамилии в _FT_MAIDEN и NAME TYPE birth/maiden сохранены без замены выбранной фамилии; альтернативы добавлены в биографии.")
+                    }
+                    let parts = alternate.text.components(separatedBy: "/")
+                    // GIVN keeps the original spelling; NAME replaces literal
+                    // slashes with spaces. Decode escapes and CONC before checking
+                    // either form, while retaining real differences in patronymics.
+                    if let structuredGiven = alternate.child("GIVN")?.text,
+                       !structuredGiven.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       !sameName(structuredGiven, given) { represented = false }
+                    if let displayedGiven = parts.first,
+                       !displayedGiven.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       !sameName(displayedGiven, given.replacingOccurrences(of: "/", with: " ")) { represented = false }
+                    if parts.count > 1, !sameName(parts[1], alternateSurname.replacingOccurrences(of: "/", with: " ")) { represented = false }
+                    if parts.dropFirst(2).contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) { represented = false }
+                }
+                if (index > 0 && !represented) || conflict {
+                    let text = alternate.text
+                    let structuredDisplay = [alternate.child("GIVN")?.text, surnameFromName(alternate)].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " ")
+                    preserveName(text.isEmpty ? structuredDisplay : text.replacingOccurrences(of: "/", with: ""))
+                    // Conflicting structured GIVN is also evidence; the raw NAME
+                    // alone cannot preserve it when the two forms disagree.
+                    if !text.isEmpty, let structuredGiven = alternate.child("GIVN")?.text,
+                       !structuredGiven.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       !sameName(structuredGiven, given),
+                       !sameName(structuredGiven.replacingOccurrences(of: "/", with: " "), text.components(separatedBy: "/").first ?? "") {
+                        preserveName(structuredDisplay)
+                    }
                 }
             }
-            // Famytale exports additional surnames in NAME/_MARNM. Exporters do
-            // not agree whether the primary NAME is a birth or current name, so
-            // retain the payload without guessing which surname should be maiden.
-            let otherNames = unique(names.flatMap { $0.children.filter { $0.tag == "_MARNM" }.map(\.text) })
-            for otherName in otherNames where !otherName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                person.biography += (person.biography.isEmpty ? "" : "\n\n") + "Другое имя из GEDCOM: " + otherName
-                warn("Дополнительные имена и фамилии из _MARNM сохранены в биографиях. Основное имя и девичья фамилия не изменены автоматически.")
+            // FamyTale's one-name dialect stores the birth surname in SURN and
+            // the married surname in _MARNM. Restrict this interpretation to its
+            // explicit source ID and a single unambiguous surname. Other dialects,
+            // multiple names and full-name payloads remain available as notes.
+            var seenOtherNames = Set<String>()
+            let otherNames = names.flatMap { $0.children.filter { $0.tag == "_MARNM" }.map(\.text) }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty && seenOtherNames.insert($0.lowercased()).inserted }
+            let primaryType = name?.child("TYPE")?.value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            var mappedMarriedName = false
+            if isFamytale, names.count == 1, otherNames.count == 1,
+               let marriedSurname = otherNames.first, isSimpleSurname(marriedSurname),
+               !primarySurname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               ["", "birth", "maiden"].contains(primaryType),
+               sameName(marriedSurname, primarySurname) || person.maidenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sameName(person.maidenName, primarySurname) {
+                if !sameName(marriedSurname, primarySurname) {
+                    person.familyName = marriedSurname
+                    if person.maidenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { person.maidenName = primarySurname }
+                }
+                mappedMarriedName = true
+            }
+            if !mappedMarriedName {
+                for otherName in otherNames {
+                    preserveName(otherName, fromGEDCOM: true)
+                    warn("Дополнительные имена и фамилии из _MARNM сохранены в биографиях. Основное имя и девичья фамилия не изменены автоматически.")
+                }
             }
             for component in ["NPFX", "NSFX", "NICK", "SPFX"] {
                 if let extra = name?.child(component), !extra.text.isEmpty {
@@ -285,7 +343,12 @@ public enum GEDCOM {
             emit(2, "GIVN", given); emit(2, "SURN", person.familyName)
             emit(2, "_FT_GIVEN", person.givenName)
             if !person.patronymic.isEmpty { emit(2, "_FT_PATRONYMIC", person.patronymic) }
-            if !person.maidenName.isEmpty { emit(1, "_FT_MAIDEN", person.maidenName) }
+            if !person.maidenName.isEmpty {
+                emit(1, "_FT_MAIDEN", person.maidenName)
+                emit(1, "NAME", given.replacingOccurrences(of: "/", with: " ") + " /" + person.maidenName.replacingOccurrences(of: "/", with: " ") + "/")
+                emit(2, "TYPE", "maiden")
+                emit(2, "GIVN", given); emit(2, "SURN", person.maidenName)
+            }
             emit(1, "SEX", person.gender == .male ? "M" : person.gender == .female ? "F" : "U")
             if !person.birthDate.isEmpty || !person.birthPlace.isEmpty {
                 emit(1, "BIRT"); emitDate(2, person.birthDate)
@@ -376,6 +439,21 @@ public enum GEDCOM {
             }
         }
         return roots
+    }
+    private static func surnameFromName(_ name: Node) -> String? {
+        if let surname = name.child("SURN")?.text, !surname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return surname }
+        let parts = name.text.components(separatedBy: "/")
+        guard parts.count > 1 else { return nil }
+        let surname = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        return surname.isEmpty ? nil : surname
+    }
+    private static func sameName(_ first: String, _ second: String) -> Bool {
+        first.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(second.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame
+    }
+    private static func isSimpleSurname(_ value: String) -> Bool {
+        // Space-separated compounds cannot be distinguished from full names here.
+        // Preserve them in notes rather than guess or truncate.
+        value.range(of: #"^\p{L}[\p{L}\p{M}]*(?:[-'’]\p{L}[\p{L}\p{M}]*)*$"#, options: .regularExpression) != nil
     }
     private static func isPointer(_ value: String) -> Bool {
         value.count > 2 && value.hasPrefix("@") && value.hasSuffix("@") && !value.dropFirst().dropLast().contains("@") && !value.contains(" ")

@@ -39,7 +39,8 @@ struct PersonInspector: View {
                 SmallIconButton(symbol: person.isFavorite ? "star.fill" : "star", help: "Избранное") { store.toggleFavorite(person) }
                     .foregroundStyle(person.isFavorite ? .orange : .secondary)
                 Menu {
-                    Button("Сделать главным человеком") { store.setRoot(person.id) }
+                    Button("Это я — начинать дерево отсюда") { store.setRoot(person.id) }
+                        .disabled(person.id == store.project.rootPersonID)
                     Button("Добавить связь с человеком") { store.showingRelationshipEditor = true }
                     Divider()
                     Button("Удалить человека…", role: .destructive) { store.deletePerson(person) }
@@ -51,12 +52,25 @@ struct PersonInspector: View {
                 Text(person.fullName)
                     .font(.system(size: 20, weight: .medium, design: .rounded))
                     .fixedSize(horizontal: false, vertical: true)
+                if !person.maidenName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("Девичья фамилия: \(person.maidenName)")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                }
                 Text(person.lifespan).font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 2)
             }.multilineTextAlignment(.center)
             if person.id == store.project.rootPersonID {
-                Text("ГЛАВНЫЙ ЧЕЛОВЕК").font(.system(size: 8, weight: .semibold)).tracking(1)
-                    .foregroundStyle(Palette.accent).padding(.horizontal, 10).padding(.vertical, 5)
+                Label("Центр по умолчанию", systemImage: "house.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Palette.accent).padding(.horizontal, 10).padding(.vertical, 6)
                     .background(Palette.accent.opacity(0.08), in: Capsule())
+                    .help("При открытии этого файла дерево начинается с этой карточки.")
+            } else {
+                Button { store.setRoot(person.id) } label: {
+                    Label("Это я", systemImage: "person.crop.circle.badge.checkmark")
+                        .font(.system(size: 11, weight: .medium))
+                }.buttonStyle(.bordered).controlSize(.small)
+                    .help("Начинать дерево с этого человека. Выбор сохранится в файле дерева.")
             }
             HStack(spacing: 8) {
                 Button { store.edit(person) } label: { Label("Изменить", systemImage: "pencil").frame(maxWidth: .infinity) }
@@ -73,9 +87,8 @@ struct PersonInspector: View {
             if !person.birthDate.isEmpty { fact("Рождение", value: GenealogyDate.display(person.birthDate), icon: "sun.max") }
             if person.isDeceased { fact("Уход из жизни", value: person.deathDate.isEmpty ? "Дата неизвестна" : GenealogyDate.display(person.deathDate), icon: "leaf") }
             if !person.birthPlace.isEmpty { fact("Место рождения", value: person.birthPlace, icon: "mappin.and.ellipse") }
-            if !person.maidenName.isEmpty { fact("Девичья фамилия", value: person.maidenName, icon: "textformat") }
             if !person.occupation.isEmpty { fact("Дело жизни", value: person.occupation, icon: "briefcase") }
-            if person.birthDate.isEmpty && person.birthPlace.isEmpty && person.occupation.isEmpty && !person.isDeceased && person.maidenName.isEmpty {
+            if person.birthDate.isEmpty && person.birthPlace.isEmpty && person.occupation.isEmpty && !person.isDeceased {
                 Text("Добавьте даты, места и несколько слов о близком человеке.")
                     .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(4)
             }

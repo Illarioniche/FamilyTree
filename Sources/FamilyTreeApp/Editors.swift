@@ -43,10 +43,12 @@ struct PersonEditor: View {
                     }
                 }
                 Section("Имя") {
-                    TextField("Фамилия", text: $person.familyName)
+                    TextField("Основная фамилия", text: $person.familyName)
+                        .help("Эта фамилия отображается на дереве и в списке людей.")
                     TextField("Имя", text: $person.givenName)
                     TextField("Отчество", text: $person.patronymic)
                     TextField("Девичья фамилия", text: $person.maidenName)
+                        .help("Показывается в подробной карточке. По ней тоже можно найти человека.")
                     Picker("Пол", selection: $person.gender) { ForEach(Gender.allCases, id: \.self) { Text($0.title).tag($0) } }
                 }
                 Section("Жизнь") {
@@ -72,6 +74,8 @@ struct PersonEditor: View {
                 Button(request.isNew ? "Добавить" : "Сохранить") {
                     person.givenName = person.givenName.trimmingCharacters(in: .whitespacesAndNewlines)
                     person.familyName = person.familyName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    person.patronymic = person.patronymic.trimmingCharacters(in: .whitespacesAndNewlines)
+                    person.maidenName = person.maidenName.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !person.isDeceased { person.deathDate = "" }
                     store.savePerson(person, relativeID: request.relativeID, role: role, photo: photo)
                     dismiss()
@@ -201,6 +205,6 @@ struct ProjectNameEditor: View {
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-        }.padding(28).frame(width: 430).onAppear { title = store.project.title }.tint(Palette.accent)
+        }.padding(28).frame(width: 430).onAppear { title = TreeLibrary.displayTitle(store.project.title) }.tint(Palette.accent)
     }
 }
