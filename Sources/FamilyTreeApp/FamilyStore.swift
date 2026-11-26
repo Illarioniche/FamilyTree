@@ -32,6 +32,7 @@ struct PersonEditRequest: Identifiable {
     var person: Person
     var isNew: Bool
     var relativeID: UUID?
+    var creationRole: RelativeCreationRole = .child
 }
 
 struct EventEditRequest: Identifiable {
@@ -74,12 +75,19 @@ final class FamilyStore: ObservableObject {
     @Published private(set) var redoStack: [FamilyProject] = []
     private let isPreview: Bool
     private let library: TreeLibrary
+    private let trashItem: (URL) throws -> Void
     private let libraryDirectoryURL: URL
     private var registeredTreeURLs: [URL]
     private static let registeredTreesKey = "registeredTreePaths"
 
-    init(preview: Bool = false, libraryDirectoryURL: URL? = nil) {
+    init(preview: Bool = false, libraryDirectoryURL: URL? = nil,
+         trashItem: ((URL) throws -> Void)? = nil) {
         isPreview = preview
+        self.trashItem = trashItem ?? { url in
+            // Checks and previews must explicitly inject an isolated trash destination.
+            guard !preview else { throw AppError.message("Удаление отключено в режиме предпросмотра.") }
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
         let directory = libraryDirectoryURL ?? (preview
             ? FileManager.default.temporaryDirectory.appendingPathComponent("FamilyTreePreview-" + UUID().uuidString, isDirectory: true)
             : FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -120,12 +128,12 @@ final class FamilyStore: ObservableObject {
         return fileURL == nil ? "Выберите место для сохранения" : "Сохранено на этом Mac"
     }
 
-    func mutate(_ update: (inout FamilyProject) -> Void) {
+    @discardableResult func mutate(_ update: (inout FamilyProject) -> Void) -> Bool {
         var next = project
         update(&next)
-        guard next != project else { return }
+        guard next != project else { return true }
         do { try ProjectValidation.validate(next) }
-        catch { errorMessage = error.localizedDescription; return }
+        catch { errorMessage = error.localizedDescription; return false }
         undoStack.append(project)
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
@@ -133,6 +141,7 @@ final class FamilyStore: ObservableObject {
         project = next
         hasUnsavedChanges = true
         if fileURL != nil { _ = save() }
+        return true
     }
 
     func undo() {
@@ -184,6 +193,107 @@ final class FamilyStore: ObservableObject {
     func refreshLibrary() {
         do { savedTrees = try library.entries(additionalURLs: registeredTreeURLs) }
         catch { errorMessage = "Не удалось прочитать библиотеку деревьев.\n\n\(error.localizedDescription)" }
+    }
+
+    func canTrashTree(_ entry: TreeLibraryEntry) -> Bool {
+        guard savedTrees.contains(where: { $0.id == entry.id }), entry.url.isFileURL else { return false }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: entry.url.path)
+        return attributes?[.type] as? FileAttributeType == .typeRegular
+    }
+
+    func canForgetTree(_ entry: TreeLibraryEntry) -> Bool {
+        savedTrees.contains { $0.id == entry.id && $0.issue != nil }
+            && registeredTreeURLs.contains { $0.standardizedFileURL.resolvingSymlinksInPath() == entry.url }
+    }
+
+    /// Called only after the library's explicit destructive confirmation.
+    /// A failed main-file move never detaches the open document or its history.
+    @discardableResult func deleteTree(_ entry: TreeLibraryEntry) -> Bool {
+        guard canTrashTree(entry) else {
+            errorMessage = "Дерево недоступно для удаления. Обновите библиотеку или уберите недоступный файл из списка."
+            return false
+        }
+        do { try requireNoDatabaseJournal(at: entry.url) }
+        catch { errorMessage = error.localizedDescription; return false }
+        let isCurrent = fileURL?.standardizedFileURL.resolvingSymlinksInPath() == entry.url
+        // Keep the latest edits recoverable in Trash, including after an earlier autosave error.
+        if isCurrent && hasUnsavedChanges && !save() { return false }
+        do { try trashItem(entry.url) }
+        catch {
+            errorMessage = "Не удалось переместить дерево в Корзину. Оно осталось в библиотеке.\n\n\(error.localizedDescription)"
+            return false
+        }
+
+        // The previous autosave is a separate file. If it cannot be moved, retain
+        // it and report its location; never roll back by recreating the deleted tree.
+        let backup = URL(fileURLWithPath: entry.url.path + ".backup")
+        var backupWarning: String?
+        if FileManager.default.fileExists(atPath: backup.path) {
+            do {
+                let values = try backup.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                    throw AppError.message("По пути резервной копии находится другой объект.")
+                }
+                try requireNoDatabaseJournal(at: backup)
+                try trashItem(backup)
+            } catch {
+                backupWarning = "Дерево перемещено в Корзину, но его резервная копия осталась на прежнем месте:\n\(backup.path)\n\n\(error.localizedDescription)"
+            }
+        }
+        forgetTreeURL(entry.url)
+        if isCurrent { clearClosedTree() }
+        errorMessage = nil
+        refreshLibrary()
+        if let backupWarning { infoMessage = backupWarning }
+        return true
+    }
+
+    /// Forgetting an unavailable external document never changes the document itself.
+    @discardableResult func forgetUnavailableTree(_ entry: TreeLibraryEntry) -> Bool {
+        guard canForgetTree(entry) else { return false }
+        let isCurrent = fileURL?.standardizedFileURL.resolvingSymlinksInPath() == entry.url
+        guard !isCurrent || !hasUnsavedChanges else {
+            errorMessage = "В открытом дереве есть несохранённые изменения. Сначала сохраните их через «Сохранить как…», затем уберите недоступный файл из списка."
+            return false
+        }
+        forgetTreeURL(entry.url)
+        if isCurrent { clearClosedTree() }
+        errorMessage = nil
+        refreshLibrary()
+        return true
+    }
+
+    /// External SQLite documents may still have committed changes in a WAL.
+    /// Moving only the main file would make recovery incomplete.
+    private func requireNoDatabaseJournal(at url: URL) throws {
+        for suffix in ["-wal", "-journal"] {
+            if FileManager.default.fileExists(atPath: url.path + suffix) {
+                throw AppError.message("Дерево пока нельзя переместить в Корзину: рядом с файлом остался журнал изменений. Закройте дерево в других программах и попробуйте снова.")
+            }
+        }
+    }
+
+    private func forgetTreeURL(_ url: URL) {
+        registeredTreeURLs.removeAll { $0.standardizedFileURL.resolvingSymlinksInPath() == url }
+        guard !isPreview else { return }
+        UserDefaults.standard.set(registeredTreeURLs.map(\.path), forKey: Self.registeredTreesKey)
+        if let path = UserDefaults.standard.string(forKey: "lastProjectPath"),
+           URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath() == url {
+            UserDefaults.standard.removeObject(forKey: "lastProjectPath")
+        }
+    }
+
+    private func clearClosedTree() {
+        fileURL = nil
+        project = FamilyProject(title: "Моя семья")
+        selection = nil; section = .tree; query = ""
+        hasUnsavedChanges = false; isExample = false; lastSavedAt = nil
+        undoStack.removeAll(); redoStack.removeAll()
+        personEditor = nil; eventEditor = nil; treeCreation = nil
+        showingRelationshipEditor = false; showingProjectName = false
+        showingSurnameReview = false; showingHomePersonPicker = false
+        notice = nil; infoMessage = nil
+        showingTreeLibrary = true
     }
 
     func newProject() {
@@ -304,33 +414,56 @@ final class FamilyStore: ObservableObject {
     }
 
     func addPerson(relativeTo id: UUID? = nil) {
-        personEditor = PersonEditRequest(person: Person(familyName: project.person(id)?.familyName ?? ""), isNew: true, relativeID: id)
+        personEditor = PersonEditRequest(person: Person(), isNew: true, relativeID: id)
     }
     func edit(_ person: Person) { personEditor = PersonEditRequest(person: person, isNew: false) }
-    func savePerson(_ person: Person, relativeID: UUID?, role: RelativeRole, photo: Attachment?) {
+    @discardableResult
+    func savePerson(_ person: Person, relativeID: UUID?, role: RelativeRole, photo: Attachment?) -> Bool {
+        let creationRole: RelativeCreationRole
+        switch role {
+        case .parent: creationRole = .parent
+        case .child: creationRole = .child
+        case .partner: creationRole = .partner
+        case .adoptiveParent: creationRole = .adoptiveParent
+        }
+        let plan = relativeID.map { RelativeCreationPlan(role: creationRole, relativeID: $0) }
+        return savePerson(person, creationPlan: plan, photo: photo)
+    }
+
+    /// Save the card, photo and every chosen parent link as one undoable change.
+    @discardableResult
+    func savePerson(_ person: Person, creationPlan: RelativeCreationPlan?, photo: Attachment?) -> Bool {
         var savedPerson = person
         if let photo { savedPerson.photoID = photo.id }
-        mutate { tree in
-            if let index = tree.people.firstIndex(where: { $0.id == person.id }) { tree.people[index] = savedPerson }
-            else { tree.people.append(savedPerson) }
-            if tree.rootPersonID == nil { tree.rootPersonID = person.id }
-            for index in tree.events.indices where tree.events[index].personID == person.id {
-                if tree.events[index].kind == .birth {
-                    tree.events[index].date = savedPerson.birthDate
-                    tree.events[index].place = savedPerson.birthPlace
-                }
-                if tree.events[index].kind == .death { tree.events[index].date = savedPerson.deathDate }
+        var next = project
+        if let index = next.people.firstIndex(where: { $0.id == person.id }) { next.people[index] = savedPerson }
+        else { next.people.append(savedPerson) }
+        if next.rootPersonID == nil { next.rootPersonID = person.id }
+        for index in next.events.indices where next.events[index].personID == person.id {
+            if next.events[index].kind == .birth {
+                next.events[index].date = savedPerson.birthDate
+                next.events[index].place = savedPerson.birthPlace
             }
-            if !savedPerson.isDeceased {
-                tree.events.removeAll { $0.personID == person.id && $0.kind == .death }
-            }
-            if let relativeID { tree.relationships.append(role.relationship(newPersonID: person.id, relativeID: relativeID)) }
-            if let photo {
-                tree.attachments.removeAll { $0.id == photo.id }
-                tree.attachments.append(photo)
-            }
+            if next.events[index].kind == .death { next.events[index].date = savedPerson.deathDate }
         }
-        if project.person(person.id) != nil { selection = person.id }
+        if !savedPerson.isDeceased {
+            next.events.removeAll { $0.personID == person.id && $0.kind == .death }
+        }
+        if let photo {
+            next.attachments.removeAll { $0.id == photo.id }
+            next.attachments.append(photo)
+        }
+        do {
+            if let creationPlan {
+                next.relationships.append(contentsOf: try creationPlan.plannedRelationships(for: person.id, in: next))
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+        guard mutate({ $0 = next }) else { return false }
+        selection = person.id
+        return true
     }
     func deletePerson(_ person: Person) {
         let alert = NSAlert()

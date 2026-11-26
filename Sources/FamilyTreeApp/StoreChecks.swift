@@ -82,11 +82,137 @@ enum StoreChecks {
             try checkSurnameRepairs(in: directory)
             try checkHomePerson(in: directory)
             try checkTreeLibrary(in: directory)
-            print("Store integration: \(assertions) checks passed (autosave, media, dates, undo/redo, backup, surname repair, default centre, search navigation, tree library, invalid relation, save failure/retry).")
+            try checkRelativeCreation(in: directory)
+            try checkTreeDeletion(in: directory)
+            print("Store integration: \(assertions) checks passed (autosave, media, dates, undo/redo, backup, surname repair, default centre, search navigation, tree library, tree deletion, relative creation, invalid relation, save failure/retry).")
         } catch {
             fputs("Store integration FAILED: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
+    }
+
+    private static func checkRelativeCreation(in directory: URL) throws {
+        let document = directory.appendingPathComponent("Добавление-родственников.familytree")
+        let father = Person(givenName: "Илья", familyName: "Примеров", gender: .male)
+        let mother = Person(givenName: "Анна", familyName: "Примерова", gender: .female)
+        let paternalGrandfather = Person(givenName: "Павел", familyName: "Примеров", gender: .male)
+        let paternalGrandmother = Person(givenName: "Вера", familyName: "Примерова", gender: .female)
+        let maternalGrandfather = Person(givenName: "Борис", familyName: "Тестов", gender: .male)
+        let maternalGrandmother = Person(givenName: "Нина", familyName: "Тестова", gender: .female)
+        let previousChild = Person(givenName: "Сергей", familyName: "Примеров", gender: .male)
+        let original = FamilyProject(title: "Связи Примеровых", rootPersonID: father.id,
+                                     people: [father, mother, paternalGrandfather, paternalGrandmother,
+                                              maternalGrandfather, maternalGrandmother, previousChild],
+                                     relationships: [
+            Relationship(fromID: father.id, toID: mother.id, kind: .partner),
+            Relationship(fromID: paternalGrandfather.id, toID: father.id, kind: .parent),
+            Relationship(fromID: paternalGrandmother.id, toID: father.id, kind: .parent),
+            Relationship(fromID: maternalGrandfather.id, toID: mother.id, kind: .parent),
+            Relationship(fromID: maternalGrandmother.id, toID: mother.id, kind: .parent),
+            Relationship(fromID: father.id, toID: previousChild.id, kind: .parent)
+        ])
+        try ProjectDatabase.save(original, to: document)
+        let store = FamilyStore(preview: true)
+        store.replaceProject(try ProjectDatabase.load(from: document), url: document)
+        let child = Person(givenName: "Михаил", patronymic: "Ильич", familyName: "Примеров", gender: .male)
+        let photo = Attachment(personID: child.id, filename: "child.png", mimeType: "image/png", data: Data([137, 80, 78, 71, 5, 9]))
+        let plan = RelativeCreationPlan(role: .child, relativeID: father.id, secondParentID: mother.id)
+        try require(store.savePerson(child, creationPlan: plan, photo: photo),
+                    "Saving a new child with two selected parents and photo should succeed")
+        try require(store.undoStack.count == 1 && !store.hasUnsavedChanges && store.selection == child.id,
+                    "Person, both links and photo must be one saved undo step with the new card selected")
+        var saved = try ProjectDatabase.load(from: document)
+        try require(Set(saved.parents(of: child.id).map(\.id)) == Set([father.id, mother.id]),
+                    "Both explicitly selected parents must survive reopening")
+        try require(saved.relationships.count == original.relationships.count + 2,
+                    "Adding a child must not persist redundant grandparent or sibling links")
+        try require(saved.person(child.id)?.photoID == photo.id && saved.attachments.first(where: { $0.id == photo.id }) == photo,
+                    "The child photo and its association must be saved with the new family links")
+        let close = TreeScope.make(project: saved, focusID: child.id, mode: .close)
+        try require(Set(close.project.people.map(\.id)) == Set(original.people.map(\.id) + [child.id]),
+                    "The reopened child must see both parents, all four grandparents and the existing half sibling")
+        try require(saved.parents(of: previousChild.id).map(\.id) == [father.id],
+                    "Adding another child must not assign a new parent to existing children")
+
+        let created = store.project
+        store.undo()
+        try require(store.project.people == original.people && store.project.relationships == original.relationships && store.project.attachments.isEmpty,
+                    "One undo must remove the child, both parent links and its photo together")
+        saved = try ProjectDatabase.load(from: document)
+        try require(saved.people == original.people && saved.relationships == original.relationships && saved.attachments.isEmpty,
+                    "Undo of relative creation must persist the complete previous family")
+        store.redo()
+        saved = try ProjectDatabase.load(from: document)
+        try require(saved.people == created.people && saved.relationships == created.relationships && saved.attachments == created.attachments,
+                    "One redo must restore and persist the complete relative creation")
+        let undoAfterCreate = store.undoStack.count
+        let bytesAfterCreate = try Data(contentsOf: document)
+        try require(store.savePerson(child, creationPlan: plan, photo: photo),
+                    "Repeating the same successful save should be harmless")
+        try require(store.project.people.count == created.people.count && store.project.relationships == created.relationships && store.project.attachments == created.attachments,
+                    "Repeated save must not duplicate the person, links or photo")
+        try require(store.undoStack.count == undoAfterCreate && (try Data(contentsOf: document)) == bytesAfterCreate,
+                    "An unchanged repeated save must not add history or rewrite the document")
+
+        // Keep a redo entry while testing rejection: neither history direction may change.
+        store.undo()
+        store.selection = mother.id
+        let beforeInvalid = store.project
+        let undoBeforeInvalid = store.undoStack
+        let redoBeforeInvalid = store.redoStack
+        let selectionBeforeInvalid = store.selection
+        let fileBeforeInvalid = try Data(contentsOf: document)
+        let backupURL = URL(fileURLWithPath: document.path + ".backup")
+        let backupBeforeInvalid = try Data(contentsOf: backupURL)
+        let invalidChild = Person(givenName: "Несохранённый ребёнок")
+        let invalidPhoto = Attachment(personID: invalidChild.id, filename: "invalid-child.png", mimeType: "image/png", data: Data([1, 2, 3]))
+        let invalidPlan = RelativeCreationPlan(role: .child, relativeID: father.id, secondParentID: UUID())
+        try require(!store.savePerson(invalidChild, creationPlan: invalidPlan, photo: invalidPhoto),
+                    "A missing second parent must reject the complete relative save")
+        try require(store.errorMessage != nil && store.project == beforeInvalid && !store.hasUnsavedChanges,
+                    "Rejected relative creation must leave no person, links, attachment or dirty state")
+        try require(store.undoStack == undoBeforeInvalid && store.redoStack == redoBeforeInvalid && store.selection == selectionBeforeInvalid,
+                    "Rejected relative creation must preserve undo, redo and selection")
+        try require((try Data(contentsOf: document)) == fileBeforeInvalid && (try Data(contentsOf: backupURL)) == backupBeforeInvalid,
+                    "Rejected relative creation must preserve both the document and its backup byte-for-byte")
+        store.errorMessage = nil
+        store.redo()
+
+        var newPartner = Person(givenName: "Ольга", familyName: "Иванова", maidenName: "Сидорова", gender: .female)
+        let beforePartner = store.project.relationships
+        try require(store.savePerson(newPartner, creationPlan: .init(role: .partner, relativeID: father.id), photo: nil),
+                    "A new partner should be saved through the same relative-creation transaction")
+        try require(store.project.relationships.count == beforePartner.count + 1 && store.project.children(of: newPartner.id).isEmpty,
+                    "A new partner must not automatically become parent of the anchor's existing children")
+        try require(Set(store.project.parents(of: child.id).map(\.id)) == Set([father.id, mother.id]) && store.project.parents(of: previousChild.id).map(\.id) == [father.id],
+                    "Creating a partnership must preserve the existing children's parent sets")
+        let halfSibling = Person(givenName: "Мария", familyName: "Примерова", gender: .female)
+        try require(store.savePerson(halfSibling, creationPlan: .init(role: .sibling, relativeID: child.id, sharedParentIDs: [mother.id]), photo: nil),
+                    "Creating a sibling with one explicitly selected shared parent should succeed")
+        saved = try ProjectDatabase.load(from: document)
+        try require(saved.parents(of: halfSibling.id).map(\.id) == [mother.id],
+                    "The sibling must share only the selected parent after reopening")
+        let siblingClose = TreeScope.make(project: saved, focusID: halfSibling.id, mode: .close)
+        try require(siblingClose.project.person(child.id) != nil && siblingClose.project.person(previousChild.id) == nil,
+                    "Half-sibling scope must follow actual shared parents without inventing additional sibling links")
+
+        let adoptedChild = Person(givenName: "Алексей", familyName: "Примеров", gender: .male)
+        try require(store.savePerson(adoptedChild, creationPlan: .init(role: .adoptedChild, relativeID: father.id, secondParentID: mother.id), photo: nil),
+                    "An adopted child can be created with two explicitly selected adoptive parents")
+        saved = try ProjectDatabase.load(from: document)
+        let adoptiveLinks = saved.relationships.filter { $0.toID == adoptedChild.id && $0.kind.isParent }
+        try require(adoptiveLinks.count == 2 && adoptiveLinks.allSatisfy { $0.kind == .adoptiveParent },
+                    "Both adoptive links must retain their kind after autosave and reopening")
+
+        newPartner.gender = .male
+        let beforeEditLinks = store.project.relationships
+        try require(store.savePerson(newPartner, creationPlan: nil, photo: nil),
+                    "Editing an existing person's gender must remain valid")
+        saved = try ProjectDatabase.load(from: document)
+        try require(saved.person(newPartner.id)?.gender == .male && saved.person(newPartner.id)?.maidenName == "Сидорова",
+                    "Hiding the maiden-name field for a man must not erase a previously saved surname")
+        try require(saved.relationships == beforeEditLinks,
+                    "An ordinary person edit must not infer or rewrite family connections")
     }
 
     private static func checkSurnameRepairs(in directory: URL) throws {
@@ -372,6 +498,231 @@ enum StoreChecks {
         let reopened = FamilyStore(preview: true, libraryDirectoryURL: libraryURL)
         try require(reopened.savedTrees.count == 4 && reopened.showingTreeLibrary,
                     "A fresh isolated library should discover managed trees without reading real user preferences")
+    }
+
+    private static func checkTreeDeletion(in directory: URL) throws {
+        let manager = FileManager.default
+        let base = directory.appendingPathComponent("DeletionChecks", isDirectory: true)
+        let libraryURL = base.appendingPathComponent("Library", isDirectory: true)
+        let trashURL = base.appendingPathComponent("TestTrash", isDirectory: true)
+        try manager.createDirectory(at: trashURL, withIntermediateDirectories: true)
+        var moved: [URL] = []
+        let store = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { source in
+            try manager.moveItem(at: source, to: trashURL.appendingPathComponent(source.lastPathComponent))
+            moved.append(source)
+        })
+        let library = TreeLibrary(directoryURL: libraryURL)
+        let person = Person(givenName: "Анна", familyName: "Проверкина")
+        let attachment = Attachment(personID: person.id, filename: "note.txt", mimeType: "text/plain", data: Data("Семейная запись".utf8))
+        let first = FamilyProject(title: "Для удаления", rootPersonID: person.id, people: [person], attachments: [attachment])
+        let firstURL = try library.create(first)
+        store.openProject(at: firstURL)
+        store.mutate { $0.title = "Последняя редакция" }
+        guard let firstEntry = store.savedTrees.first(where: { $0.url == firstURL }) else { throw AppError.message("Expected deletion candidate") }
+        let backupURL = URL(fileURLWithPath: firstURL.path + ".backup")
+        let savedBytes = try Data(contentsOf: firstURL)
+        let backupBytes = try Data(contentsOf: backupURL)
+        store.personEditor = PersonEditRequest(person: person, isNew: false)
+        store.eventEditor = EventEditRequest(event: FamilyEvent(personID: person.id, kind: .birth, date: "2000"))
+        store.showingRelationshipEditor = true
+        store.showingProjectName = true
+        store.showingHomePersonPicker = true
+        store.showingSurnameReview = true
+        store.newProject()
+        store.query = "Анна"
+        try require(store.canTrashTree(firstEntry) && !store.canForgetTree(firstEntry), "Managed trees should expose Trash, not removal from the external list")
+        try require(store.deleteTree(firstEntry), "Confirmed deletion should move the active managed tree to the injected Trash")
+        try require(moved == [firstURL, backupURL], "The document must be trashed before its automatic backup")
+        try require(!manager.fileExists(atPath: firstURL.path) && !manager.fileExists(atPath: backupURL.path), "Deleted document and backup must disappear from their original locations")
+        try require(try Data(contentsOf: trashURL.appendingPathComponent(firstURL.lastPathComponent)) == savedBytes, "Trash must preserve the complete document bytes, including attachments")
+        try require(try Data(contentsOf: trashURL.appendingPathComponent(backupURL.lastPathComponent)) == backupBytes, "Trash must preserve the previous automatic backup bytes")
+        try require(store.fileURL == nil && store.project.people.isEmpty && store.project.attachments.isEmpty && store.selection == nil && !store.hasUnsavedChanges && store.showingTreeLibrary && store.lastSavedAt == nil,
+                    "Deleting the active tree must close its in-memory session and return to an empty library")
+        try require(store.undoStack.isEmpty && store.redoStack.isEmpty && store.personEditor == nil && store.eventEditor == nil && store.treeCreation == nil && !store.showingRelationshipEditor && !store.showingProjectName && !store.showingHomePersonPicker && !store.showingSurnameReview && store.query.isEmpty,
+                    "Deletion must clear history, pending editors, dialogs and search tied to the removed document")
+        store.undo(); store.redo()
+        store.mutate { $0.title = "Другое дерево" }
+        try require(!manager.fileExists(atPath: firstURL.path) && store.fileURL == nil, "Undo, redo and subsequent edits must not resurrect the deleted file")
+        store.refreshLibrary()
+        try require(store.savedTrees.isEmpty, "A refresh must not rediscover the deleted tree or its backup")
+
+        let inactiveURL = try library.create(FamilyProject(title: "Неактивное"))
+        let activeURL = try library.create(FamilyProject(title: "Активное"))
+        store.replaceProject(try ProjectDatabase.load(from: activeURL), url: activeURL)
+        store.mutate { $0.title = "С изменениями" }
+        store.showLibrary()
+        guard let inactive = store.savedTrees.first(where: { $0.url == inactiveURL }) else { throw AppError.message("Expected inactive deletion candidate") }
+        let activeBefore = store.project
+        let historyBefore = store.undoStack
+        let activeBytes = try Data(contentsOf: activeURL)
+        try require(store.deleteTree(inactive), "Deleting an inactive managed tree should succeed")
+        try require(store.project == activeBefore && store.fileURL == activeURL && store.undoStack == historyBefore && (try Data(contentsOf: activeURL)) == activeBytes,
+                    "Deleting another tree must preserve the active document, its bytes and undo history")
+        let fresh = FamilyStore(preview: true, libraryDirectoryURL: libraryURL)
+        try require(fresh.savedTrees.map(\.url) == [activeURL], "Reopening an isolated library should list only remaining managed documents")
+
+        let externalURL = base.appendingPathComponent("External.familytree")
+        try ProjectDatabase.save(FamilyProject(title: "Внешнее"), to: externalURL)
+        store.openProject(at: externalURL)
+        guard let external = store.savedTrees.first(where: { $0.url == externalURL }) else { throw AppError.message("Expected external deletion candidate") }
+        try require(store.deleteTree(external), "Registered external documents can also be moved to Trash")
+        store.refreshLibrary()
+        try require(!store.savedTrees.contains(where: { $0.id == external.id }) && !manager.fileExists(atPath: externalURL.path), "Trashing an external tree must unregister it rather than leave an unavailable entry")
+        let unrelatedURL = base.appendingPathComponent("NotRegistered.familytree")
+        try ProjectDatabase.save(FamilyProject(title: "Постороннее"), to: unrelatedURL)
+        let unrelated = TreeLibraryEntry(url: unrelatedURL, title: "Постороннее", peopleCount: 0, modifiedAt: Date())
+        let movedBefore = moved.count
+        try require(!store.canTrashTree(unrelated) && !store.deleteTree(unrelated) && moved.count == movedBefore && manager.fileExists(atPath: unrelatedURL.path),
+                    "An arbitrary file not in this library must never reach the Trash handler")
+
+        let failedURL = try library.create(FamilyProject(title: "Ошибка удаления"))
+        let failed = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { _ in throw AppError.message("Injected Trash failure") })
+        failed.openProject(at: failedURL)
+        failed.mutate { $0.title = "Нужно сохранить" }
+        guard let failedEntry = failed.savedTrees.first(where: { $0.url == failedURL }) else { throw AppError.message("Expected failed deletion candidate") }
+        let failedProject = failed.project
+        let failedHistory = failed.undoStack
+        let failedList = failed.savedTrees
+        let failedBytes = try Data(contentsOf: failedURL)
+        try require(!failed.deleteTree(failedEntry) && failed.errorMessage != nil, "Trash failure must be reported")
+        try require(failed.project == failedProject && failed.fileURL == failedURL && failed.undoStack == failedHistory && failed.savedTrees == failedList && (try Data(contentsOf: failedURL)) == failedBytes,
+                    "Trash failure must retain the active session, library, history and file")
+
+        var saveTrashCalls = 0
+        let dirty = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { source in
+            saveTrashCalls += 1
+            try manager.moveItem(at: source, to: trashURL.appendingPathComponent(source.lastPathComponent))
+        })
+        dirty.openProject(at: failedURL)
+        try Data("unrecognized document".utf8).write(to: failedURL, options: .atomic)
+        dirty.mutate { $0.title = "Несохранённая редакция" }
+        guard let dirtyEntry = dirty.savedTrees.first(where: { $0.url == failedURL }) else { throw AppError.message("Expected dirty deletion candidate") }
+        try require(dirty.hasUnsavedChanges && !dirty.deleteTree(dirtyEntry) && saveTrashCalls == 0 && dirty.hasUnsavedChanges && dirty.project.title == "Несохранённая редакция",
+                    "An unsaved active tree must not be trashed when its latest changes cannot be saved")
+        try failedBytes.write(to: failedURL, options: .atomic)
+        try require(dirty.deleteTree(dirtyEntry) && !dirty.hasUnsavedChanges, "Once saving works, deleting a dirty tree should save its latest state before trashing")
+        try require(try ProjectDatabase.load(from: trashURL.appendingPathComponent(failedURL.lastPathComponent)).title == "Несохранённая редакция",
+                    "Restoring a deleted dirty tree from Trash must recover the latest in-memory changes")
+
+        let partialURL = try library.create(FamilyProject(title: "Копия недоступна"))
+        let partial = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { source in
+            if source.pathExtension == "backup" { throw AppError.message("Injected backup failure") }
+            try manager.moveItem(at: source, to: trashURL.appendingPathComponent(source.lastPathComponent))
+        })
+        partial.openProject(at: partialURL)
+        partial.mutate { $0.title = "Есть резервная копия" }
+        guard let partialEntry = partial.savedTrees.first(where: { $0.url == partialURL }) else { throw AppError.message("Expected backup failure candidate") }
+        try require(partial.deleteTree(partialEntry) && partial.fileURL == nil && partial.infoMessage != nil,
+                    "If only the backup cannot be trashed, close the deleted document and explain the remaining backup")
+        try require(manager.fileExists(atPath: partialURL.path + ".backup") && !manager.fileExists(atPath: partialURL.path), "Backup failure must preserve its bytes without recreating the removed main file")
+
+        let missingURL = base.appendingPathComponent("Missing.familytree")
+        try ProjectDatabase.save(FamilyProject(title: "Исчезнувшее"), to: missingURL)
+        store.openProject(at: missingURL)
+        let movedMissing = base.appendingPathComponent("Moved.familytree")
+        try manager.moveItem(at: missingURL, to: movedMissing)
+        store.refreshLibrary()
+        guard let missing = store.savedTrees.first(where: { $0.url == missingURL }) else { throw AppError.message("Expected missing external entry") }
+        let callsBeforeForget = moved.count
+        try require(store.canForgetTree(missing) && !store.canTrashTree(missing) && store.forgetUnavailableTree(missing), "An unavailable external tree can be removed from the list without trashing a file")
+        store.refreshLibrary()
+        try require(!store.savedTrees.contains(where: { $0.id == missing.id }) && store.fileURL == nil && store.showingTreeLibrary && moved.count == callsBeforeForget && manager.fileExists(atPath: movedMissing.path),
+                    "Forgetting an unavailable active tree must close the session, unregister it and leave relocated data alone")
+        store.openProject(at: movedMissing)
+        let corruptBytes = Data("damaged external document".utf8)
+        try corruptBytes.write(to: movedMissing, options: .atomic)
+        store.refreshLibrary()
+        guard let corrupt = store.savedTrees.first(where: { $0.url == movedMissing }) else { throw AppError.message("Expected corrupt external entry") }
+        store.mutate { $0.title = "Несохранённое" }
+        try require(!store.forgetUnavailableTree(corrupt) && store.hasUnsavedChanges && store.fileURL == movedMissing, "Forgetting an unavailable active tree must not discard unsaved edits")
+        store.replaceProject(FamilyProject(title: "Другая сессия"), url: nil)
+        store.mutate { $0.title = "Несохранённая другая сессия" }
+        let unsavedBeforeForget = store.project
+        let unsavedHistoryBeforeForget = store.undoStack
+        try require(store.canForgetTree(corrupt) && store.forgetUnavailableTree(corrupt) && (try Data(contentsOf: movedMissing)) == corruptBytes,
+                    "Forgetting a corrupt inactive external tree must leave the original file untouched")
+        try require(store.project == unsavedBeforeForget && store.undoStack == unsavedHistoryBeforeForget && store.hasUnsavedChanges,
+                    "Removing another unavailable entry must preserve the current unsaved work and its undo history")
+
+        // SQLite sidecars may hold committed or in-flight data that must stay beside
+        // the main file. Even saving a dirty session is unsafe until they are closed.
+        let journalURL = try library.create(FamilyProject(title: "Открытый журнал"))
+        var journalTrashCalls = 0
+        let journalStore = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { _ in journalTrashCalls += 1 })
+        journalStore.openProject(at: journalURL)
+        let journalOriginal = try Data(contentsOf: journalURL)
+        try Data("temporarily unrecognized".utf8).write(to: journalURL, options: .atomic)
+        journalStore.mutate { $0.title = "Редакция в памяти" }
+        try journalOriginal.write(to: journalURL, options: .atomic)
+        guard let journalEntry = journalStore.savedTrees.first(where: { $0.url == journalURL }) else { throw AppError.message("Expected SQLite sidecar candidate") }
+        let journalProject = journalStore.project
+        let journalHistory = journalStore.undoStack
+        for suffix in ["-wal", "-journal"] {
+            let sidecar = URL(fileURLWithPath: journalURL.path + suffix)
+            let marker = Data("Unprocessed SQLite sidecar \(suffix)".utf8)
+            try marker.write(to: sidecar)
+            try require(!journalStore.deleteTree(journalEntry) && journalTrashCalls == 0 && journalStore.hasUnsavedChanges && journalStore.project == journalProject && journalStore.undoStack == journalHistory && journalStore.fileURL == journalURL,
+                        "A SQLite sidecar must block both saving and deletion without changing the active dirty session")
+            try require((try Data(contentsOf: journalURL)) == journalOriginal && (try Data(contentsOf: sidecar)) == marker && journalStore.errorMessage?.range(of: "[А-Яа-яЁё]", options: .regularExpression) != nil,
+                        "A blocked SQLite deletion must preserve document and sidecar bytes and explain the failure in Russian")
+            try manager.removeItem(at: sidecar)
+        }
+
+        let backupJournalURL = try library.create(FamilyProject(title: "Журнал резервной копии"))
+        var backupJournalMoves: [URL] = []
+        let backupJournalStore = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { source in
+            try manager.moveItem(at: source, to: trashURL.appendingPathComponent(source.lastPathComponent))
+            backupJournalMoves.append(source)
+        })
+        backupJournalStore.openProject(at: backupJournalURL)
+        backupJournalStore.mutate { $0.title = "Основное дерево готово" }
+        let guardedBackup = URL(fileURLWithPath: backupJournalURL.path + ".backup")
+        let guardedBackupBytes = try Data(contentsOf: guardedBackup)
+        let backupSidecar = URL(fileURLWithPath: guardedBackup.path + "-wal")
+        let backupMarker = Data("Backup SQLite sidecar".utf8)
+        try backupMarker.write(to: backupSidecar)
+        guard let backupJournalEntry = backupJournalStore.savedTrees.first(where: { $0.url == backupJournalURL }) else { throw AppError.message("Expected backup sidecar candidate") }
+        try require(backupJournalStore.deleteTree(backupJournalEntry) && backupJournalMoves == [backupJournalURL] && backupJournalStore.fileURL == nil && backupJournalStore.infoMessage != nil,
+                    "An active backup sidecar should leave only that backup in place with a warning after the main tree is trashed")
+        try require((try Data(contentsOf: guardedBackup)) == guardedBackupBytes && (try Data(contentsOf: backupSidecar)) == backupMarker,
+                    "The backup and its SQLite sidecar must remain together and byte-for-byte intact")
+
+        let directoryURL = base.appendingPathComponent("ReplacedByDirectory.familytree")
+        try ProjectDatabase.save(FamilyProject(title: "Заменено папкой"), to: directoryURL)
+        var directoryTrashCalls = 0
+        let directoryStore = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { _ in directoryTrashCalls += 1 })
+        directoryStore.openProject(at: directoryURL)
+        guard let directoryEntry = directoryStore.savedTrees.first(where: { $0.url == directoryURL }) else { throw AppError.message("Expected directory replacement candidate") }
+        let heldDirectoryFile = base.appendingPathComponent("HeldDocument.familytree")
+        try manager.moveItem(at: directoryURL, to: heldDirectoryFile)
+        try manager.createDirectory(at: directoryURL, withIntermediateDirectories: false)
+        let directoryContent = directoryURL.appendingPathComponent("unrelated.txt")
+        let directoryMarker = Data("Do not move this folder".utf8)
+        try directoryMarker.write(to: directoryContent)
+        try require(!directoryStore.canTrashTree(directoryEntry) && !directoryStore.deleteTree(directoryEntry) && directoryTrashCalls == 0 && directoryStore.fileURL == directoryURL && (try Data(contentsOf: directoryContent)) == directoryMarker,
+                    "A document path replaced by a directory must never move that directory or its unrelated contents to Trash")
+
+        let symlinkURL = try library.create(FamilyProject(title: "Ссылка вместо копии"))
+        var symlinkMoves: [URL] = []
+        let symlinkStore = FamilyStore(preview: true, libraryDirectoryURL: libraryURL, trashItem: { source in
+            try manager.moveItem(at: source, to: trashURL.appendingPathComponent(source.lastPathComponent))
+            symlinkMoves.append(source)
+        })
+        symlinkStore.openProject(at: symlinkURL)
+        let backupLink = URL(fileURLWithPath: symlinkURL.path + ".backup")
+        let linkTarget = base.appendingPathComponent("UnrelatedBackupTarget.txt")
+        let targetBytes = Data("Do not follow this backup link".utf8)
+        try targetBytes.write(to: linkTarget)
+        try manager.createSymbolicLink(at: backupLink, withDestinationURL: linkTarget)
+        guard let symlinkEntry = symlinkStore.savedTrees.first(where: { $0.url == symlinkURL }) else { throw AppError.message("Expected backup symlink candidate") }
+        try require(symlinkStore.deleteTree(symlinkEntry) && symlinkMoves == [symlinkURL] && symlinkStore.infoMessage != nil && (try Data(contentsOf: linkTarget)) == targetBytes && (try backupLink.resourceValues(forKeys: [.isSymbolicLinkKey])).isSymbolicLink == true,
+                    "A symbolic-link backup must remain untouched and never cause its unrelated target to be moved")
+
+        let preview = FamilyStore(preview: true, libraryDirectoryURL: libraryURL)
+        guard let previewEntry = preview.savedTrees.first else { throw AppError.message("Expected preview safeguard candidate") }
+        let previewBytes = try Data(contentsOf: previewEntry.url)
+        try require(!preview.deleteTree(previewEntry) && (try Data(contentsOf: previewEntry.url)) == previewBytes,
+                    "Preview mode without an injected handler must never use the real macOS Trash")
     }
 
     private static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {

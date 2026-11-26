@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
 import FamilyTreeCore
 
 struct TreeLibraryView: View {
     @ObservedObject var store: FamilyStore
+    @State private var pendingRemoval: TreeRemovalRequest?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,9 +48,13 @@ struct TreeLibraryView: View {
                     } else {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 270), spacing: 18)], spacing: 18) {
                             ForEach(store.savedTrees) { entry in
-                                TreeLibraryCard(entry: entry, isCurrent: isCurrent(entry)) {
-                                    store.openLibraryTree(entry)
-                                }
+                                TreeLibraryCard(
+                                    entry: entry, isCurrent: isCurrent(entry),
+                                    canTrash: store.canTrashTree(entry), canForget: store.canForgetTree(entry),
+                                    open: { store.openLibraryTree(entry) },
+                                    delete: { pendingRemoval = TreeRemovalRequest(entry: entry, forgetOnly: false) },
+                                    forget: { pendingRemoval = TreeRemovalRequest(entry: entry, forgetOnly: true) }
+                                )
                             }
                         }
                     }
@@ -69,6 +75,18 @@ struct TreeLibraryView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Palette.canvas).tint(Palette.accent)
+        .alert(pendingRemoval?.title ?? "Удалить дерево?", isPresented: Binding(
+            get: { pendingRemoval != nil },
+            set: { if !$0 { pendingRemoval = nil } }
+        ), presenting: pendingRemoval) { request in
+            Button(request.forgetOnly ? "Убрать из списка" : "Переместить в Корзину", role: .destructive) {
+                if request.forgetOnly { _ = store.forgetUnavailableTree(request.entry) }
+                else { _ = store.deleteTree(request.entry) }
+            }
+            Button("Отмена", role: .cancel) { }
+        } message: { request in
+            Text(request.message)
+        }
     }
 
     private var libraryActions: some View {
@@ -122,12 +140,68 @@ struct TreeLibraryView: View {
     }
 }
 
+private struct TreeRemovalRequest {
+    let entry: TreeLibraryEntry
+    let forgetOnly: Bool
+
+    var title: String {
+        forgetOnly ? "Убрать дерево из списка?" : "Удалить дерево «\(entry.title)»?"
+    }
+
+    var message: String {
+        let explanation = forgetOnly
+            ? "Запись исчезнет из библиотеки. Сам файл останется без изменений. Его можно будет открыть снова, когда он станет доступен."
+            : "Дерево со всеми людьми, фотографиями и документами, а также его резервная копия (если есть) будут перемещены в Корзину. Оттуда их можно восстановить."
+        return explanation + "\n\nФайл: " + entry.url.path
+    }
+}
+
 private struct TreeLibraryCard: View {
     let entry: TreeLibraryEntry
     let isCurrent: Bool
+    let canTrash: Bool
+    let canForget: Bool
     let open: () -> Void
+    let delete: () -> Void
+    let forget: () -> Void
 
     var body: some View {
+        ZStack(alignment: .topTrailing) {
+            openButton
+            Menu { cardActions } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 30, height: 30)
+                    .background(Palette.accent.opacity(0.06), in: Circle())
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .padding(.top, 29).padding(.trailing, 22)
+            .help("Действия с деревом")
+            .accessibilityLabel("Действия с деревом «\(entry.title)»")
+        }
+        .contextMenu { cardActions }
+    }
+
+    @ViewBuilder private var cardActions: some View {
+        if entry.issue == nil {
+            Button("Открыть дерево", systemImage: "arrow.up.right", action: open)
+        }
+        if entry.url.isFileURL {
+            Button("Показать в Finder", systemImage: "folder") {
+                NSWorkspace.shared.activateFileViewerSelecting([entry.url])
+            }
+        }
+        if canTrash || canForget { Divider() }
+        if canTrash {
+            Button("Удалить дерево…", systemImage: "trash", role: .destructive, action: delete)
+        }
+        if canForget {
+            Button("Убрать из списка…", systemImage: "minus.circle", action: forget)
+        }
+    }
+
+    private var openButton: some View {
         Button(action: open) {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 8) {
@@ -144,6 +218,7 @@ private struct TreeLibraryCard: View {
                             .padding(.horizontal, 8).padding(.vertical, 5)
                             .background(Palette.accent.opacity(0.08), in: Capsule())
                     }
+                    Color.clear.frame(width: 30, height: 30)
                 }
                 VStack(alignment: .leading, spacing: 7) {
                     Text(entry.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Семейное дерево" : entry.title)

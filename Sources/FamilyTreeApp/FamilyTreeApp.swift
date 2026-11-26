@@ -217,14 +217,18 @@ enum PreviewRenderer {
         if CommandLine.arguments.contains("--library-empty") { store.showLibrary() }
         let creationPreview = CommandLine.arguments.contains("--tree-creation")
         if creationPreview { store.newProject() }
-        let editor = CommandLine.arguments.contains("--person-editor")
+        var relativeRole: RelativeCreationRole?
+        if let index = CommandLine.arguments.firstIndex(of: "--relative-editor"), CommandLine.arguments.count > index + 1 {
+            relativeRole = RelativeCreationRole(rawValue: CommandLine.arguments[index + 1])
+        }
+        let editor = CommandLine.arguments.contains("--person-editor") || relativeRole != nil
         let empty = CommandLine.arguments.contains("--empty")
         if empty { store.replaceProject(FamilyProject(), url: nil) }
         let homePicker = CommandLine.arguments.contains("--home-picker")
         let size = creationPreview ? NSSize(width: 540, height: 340)
             : surnameReview ? NSSize(width: 680, height: 600)
             : homePicker ? NSSize(width: 560, height: 600)
-            : editor ? NSSize(width: 610, height: 715)
+            : editor ? NSSize(width: 640, height: 740)
             : NSSize(width: CommandLine.arguments.contains("--narrow") ? 1050 : 1440, height: 900)
         let view: AnyView
         if creationPreview, let request = store.treeCreation {
@@ -233,6 +237,13 @@ enum PreviewRenderer {
             view = AnyView(SurnameReviewView(store: store))
         } else if homePicker {
             view = AnyView(HomePersonPicker(store: store))
+        } else if let relativeRole {
+            var person = Person()
+            if let index = CommandLine.arguments.firstIndex(of: "--editor-gender"), CommandLine.arguments.count > index + 1 {
+                person.gender = Gender(rawValue: CommandLine.arguments[index + 1]) ?? .unspecified
+            }
+            view = AnyView(PersonEditor(store: store, request: PersonEditRequest(person: person, isNew: true,
+                relativeID: store.selection, creationRole: relativeRole)))
         } else if editor {
             view = AnyView(PersonEditor(store: store, request: PersonEditRequest(person: store.selectedPerson ?? Person(), isNew: false)))
         } else {
